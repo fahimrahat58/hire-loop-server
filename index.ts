@@ -325,6 +325,42 @@ app.delete("/api/jobs/:id", async (req: Request, res: Response) => {
 // POST APPLY FOR A JOB
 // ------------------------------------
 
+app.get("/api/applications/check", async (req: Request, res: Response) => {
+  try {
+    const { jobId, email } = req.query;
+
+    if (
+      typeof jobId !== "string" ||
+      !ObjectId.isValid(jobId) ||
+      typeof email !== "string" ||
+      !email.trim()
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Valid job ID and email are required",
+      });
+      return;
+    }
+
+    const existingApplication = await applicationsCollection.findOne({
+      jobId: new ObjectId(jobId),
+      applicantEmail: email.trim().toLowerCase(),
+    });
+
+    res.status(200).json({
+      success: true,
+      applied: !!existingApplication,
+    });
+  } catch (error) {
+    console.error("CHECK APPLICATION ERROR:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to check application",
+    });
+  }
+});
+
 app.post("/api/applications", async (req: Request, res: Response) => {
   try {
     const { jobId, name, email, experience, resumeUrl, coverLetter } = req.body;
