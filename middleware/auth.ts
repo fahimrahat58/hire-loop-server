@@ -19,18 +19,10 @@ try {
   throw new Error("AUTH_BASE_URL must be a valid URL");
 }
 
-/**
- * Better Auth normalizes its `baseURL` to an origin before signing JWTs
- * (`new URL(baseURL).origin`), so the default `iss`/`aud` claims never
- * include a trailing slash or path. Normalize the value we compare against
- * the same way so `AUTH_BASE_URL` may be configured with or without a
- * trailing slash.
- *
- * Env overrides are only needed if the JWT plugin is configured with
- * explicit `jwt.issuer` / `jwt.audience` values.
- */
 const authOrigin = authBaseUrl.origin;
+
 const expectedIssuer = process.env.AUTH_JWT_ISSUER?.trim() || authOrigin;
+
 const expectedAudience = process.env.AUTH_JWT_AUDIENCE?.trim() || authOrigin;
 
 const JWKS = createRemoteJWKSet(new URL("/api/auth/jwks", authOrigin));
@@ -67,7 +59,7 @@ export const verifyUser = async (
       audience: expectedAudience,
     });
 
-    if (!payload.sub) {
+    if (!payload.sub || !ObjectId.isValid(payload.sub)) {
       res.status(401).json({
         success: false,
         message: "Invalid authentication token",
@@ -77,24 +69,9 @@ export const verifyUser = async (
 
     const db = await connectDB();
 
-    /**
-     * Better Auth stores MongoDB user IDs as ObjectIds, while the JWT `sub`
-     * claim is the string form of that ID. Query with an ObjectId so the
-     * lookup actually matches the stored document.
-     */
-    const userId = payload.sub;
-
-    if (!ObjectId.isValid(userId)) {
-      res.status(401).json({
-        success: false,
-        message: "Invalid authentication token",
-      });
-      return;
-    }
-
-    const user = await db
-      .collection("user")
-      .findOne({ _id: new ObjectId(userId) });
+    const user = await db.collection("user").findOne({
+      _id: new ObjectId(payload.sub),
+    });
 
     if (!user) {
       res.status(401).json({
@@ -106,10 +83,20 @@ export const verifyUser = async (
 
     req.authUser = {
       id: String(user._id),
-      email: String(user.email).toLowerCase(),
+      email: String(user.email || "")
+        .trim()
+        .toLowerCase(),
       name: String(user.name || ""),
-      role: String(user.role || "seeker"),
+      role: String(user.role || "seeker").toLowerCase(),
     };
+
+    if (!req.authUser.email) {
+      res.status(401).json({
+        success: false,
+        message: "Invalid user account",
+      });
+      return;
+    }
 
     next();
   } catch (error) {
@@ -130,7 +117,42 @@ export const verifySeeker = (
   if (req.authUser?.role !== "seeker") {
     res.status(403).json({
       success: false,
-      message: "Only job seekers can access saved jobs",
+      message: "Only job seekers can access this resource",
+    });
+    return;
+  }
+
+  next();
+};
+
+export const verifyRecruiter = (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  if (req.authUser?.role !== "recruiter") {
+    res.status(403).json({
+      success: false,
+      message: "Only recruiters can access this resource",
+    });
+    return;
+  }
+
+  next();
+};
+
+// Admin authorization always relies on the role loaded from MongoDB by
+// verifyUser. A role claim from the client, the frontend session or the JWT is
+// never trusted here.
+export const verifyAdmin = (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  if (req.authUser?.role !== "admin") {
+    res.status(403).json({
+      success: false,
+      message: "Only administrators can access this resource",
     });
     return;
   }

@@ -1,11 +1,15 @@
 import express, { type Request, type Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import Stripe from "stripe";
 import { ObjectId, type Collection, type Document } from "mongodb";
+
 import { connectDB } from "./config/db.js";
 import {
   verifyUser,
   verifySeeker,
+  verifyRecruiter,
+  verifyAdmin,
   type AuthRequest,
 } from "./middleware/auth.js";
 
@@ -14,9 +18,26 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ------------------------------------
-// CORS CONFIGURATION
-// ------------------------------------
+const FREE_APPLICATION_LIMIT = 5;
+const FREE_PUBLISHED_JOB_LIMIT = 5;
+
+// ====================================
+// STRIPE
+// ====================================
+
+const getStripe = () => {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+
+  if (!secretKey) {
+    throw new Error("STRIPE_SECRET_KEY is missing");
+  }
+
+  return new Stripe(secretKey);
+};
+
+// ====================================
+// CORS
+// ====================================
 
 const normalizeOrigin = (value?: string) => {
   if (!value) return null;
@@ -61,31 +82,491 @@ app.use(
   }),
 );
 
-app.use(express.json());
-
-// ------------------------------------
+// ====================================
 // DATABASE COLLECTIONS
-// ------------------------------------
+// ====================================
 
 let jobsCollection: Collection<Document>;
 let applicationsCollection: Collection<Document>;
 let savedJobsCollection: Collection<Document>;
+let subscriptionsCollection: Collection<Document>;
+let applicationUsageCollection: Collection<Document>;
+let stripeEventsCollection: Collection<Document>;
+let usersCollection: Collection<Document>;
 
-// ------------------------------------
+// ====================================
+// HELPER FUNCTIONS
+// ====================================
+
+const getJobId = (req: Request): string | null => {
+  const id = req.params.id;
+
+  return typeof id === "string" && ObjectId.isValid(id) ? id : null;
+};
+
+const getActiveSubscription = async (userId: string, role: string) => {
+  return subscriptionsCollection.findOne({
+    userId,
+    role,
+    status: "active",
+    currentPeriodEnd: { $gt: new Date() },
+  });
+};
+
+// Returns the most recent subscription for a user/role regardless of status.
+// Used by the billing dashboard so canceled/expired subscriptions can still be
+// shown instead of silently falling back to the Free plan.
+const getLatestSubscription = async (userId: string, role: string) => {
+  return subscriptionsCollection.findOne(
+    { userId, role },
+    { sort: { updatedAt: -1, createdAt: -1 } },
+  );
+};
+
+// ====================================
+// SEEKER USAGE TRACKING
+// ====================================
+
+const ensureApplicationUsageRecord = async (userId: string, email: string) => {
+  const existingCount = await applicationsCollection.countDocuments({
+    $or: [
+      { applicantUserId: userId },
+      {
+        applicantEmail: email,
+        applicantUserId: { $exists: false },
+      },
+    ],
+  });
+
+  try {
+    await applicationUsageCollection.updateOne(
+      { userId },
+      {
+        $setOnInsert: {
+          userId,
+          applicationsUsed: existingCount,
+          createdAt: new Date(),
+        },
+        $set: {
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true },
+    );
+  } catch (error) {
+    if (
+      !error ||
+      typeof error !== "object" ||
+      !("code" in error) ||
+      error.code !== 11000
+    ) {
+      throw error;
+    }
+  }
+};
+
+const reserveApplicationSlot = async (
+  userId: string,
+  email: string,
+  isPremium: boolean,
+) => {
+  await ensureApplicationUsageRecord(userId, email);
+
+  const filter: Document = { userId };
+
+  if (!isPremium) {
+    filter.applicationsUsed = {
+      $lt: FREE_APPLICATION_LIMIT,
+    };
+  }
+
+  const result = await applicationUsageCollection.updateOne(filter, {
+    $inc: {
+      applicationsUsed: 1,
+    },
+    $set: {
+      updatedAt: new Date(),
+    },
+  });
+
+  return result.modifiedCount === 1;
+};
+
+const releaseApplicationSlot = async (userId: string) => {
+  await applicationUsageCollection.updateOne(
+    {
+      userId,
+      applicationsUsed: { $gt: 0 },
+    },
+    {
+      $inc: {
+        applicationsUsed: -1,
+      },
+      $set: {
+        updatedAt: new Date(),
+      },
+    },
+  );
+};
+
+// ====================================
+// RECRUITER ACTIVE JOB TRACKING
+// ====================================
+
+// Only active jobs count toward the Free Plan limit.
+// Draft, closed and deleted jobs do not count.
+
+const countActiveJobs = async (email: string, excludeJobId?: string) => {
+  const filter: Document = {
+    ownerEmail: email,
+    status: "active",
+    closed: { $ne: true },
+  };
+
+  if (excludeJobId && ObjectId.isValid(excludeJobId)) {
+    filter._id = {
+      $ne: new ObjectId(excludeJobId),
+    };
+  }
+
+  return jobsCollection.countDocuments(filter);
+};
+
+// ====================================
+// STRIPE SUBSCRIPTION SYNC
+// ====================================
+
+const saveStripeSubscription = async (
+  subscription: Stripe.Subscription,
+  fallbackMetadata: Record<string, string> = {},
+) => {
+  const existing = await subscriptionsCollection.findOne({
+    stripeSubscriptionId: subscription.id,
+  });
+
+  const metadata = {
+    ...fallbackMetadata,
+    ...(existing?.userId ? { userId: String(existing.userId) } : {}),
+    ...(existing?.role ? { role: String(existing.role) } : {}),
+    ...subscription.metadata,
+  };
+
+  const userId = metadata.userId;
+  const role = metadata.role;
+
+  if (!userId || (role !== "seeker" && role !== "recruiter")) {
+    // Never invent ownership. If Stripe sends a subscription we cannot map to
+    // a HireLoop user, skip it instead of letting the webhook fail forever.
+    console.warn("STRIPE SUBSCRIPTION SKIPPED (missing metadata):", {
+      subscriptionId: subscription.id,
+    });
+    return false;
+  }
+
+  const subscriptionData = subscription as any;
+
+  const periodEnd =
+    subscriptionData.current_period_end ??
+    subscriptionData.items?.data?.[0]?.current_period_end;
+
+  const customerId =
+    typeof subscription.customer === "string"
+      ? subscription.customer
+      : subscription.customer.id;
+
+  // "active" covers both active and trialing subscriptions so access checks
+  // stay simple. The raw Stripe status is retained for display.
+  const status =
+    subscription.status === "active" || subscription.status === "trialing"
+      ? "active"
+      : subscription.status;
+
+  const subscriptionDocument = {
+    userId,
+    role,
+    planName: role === "seeker" ? "Seeker Premium" : "Recruiter Premium",
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id,
+    status,
+    stripeStatus: subscription.status,
+    cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+    canceledAt: subscription.canceled_at
+      ? new Date(subscription.canceled_at * 1000)
+      : null,
+    currentPeriodEnd: periodEnd ? new Date(periodEnd * 1000) : null,
+    updatedAt: new Date(),
+  };
+
+  await subscriptionsCollection.updateOne(
+    {
+      stripeSubscriptionId: subscription.id,
+    },
+    {
+      $set: subscriptionDocument,
+      $setOnInsert: {
+        createdAt: new Date(),
+      },
+    },
+    {
+      upsert: true,
+    },
+  );
+
+  console.log("STRIPE SUBSCRIPTION SYNCED:", {
+    userId,
+    role,
+    subscriptionId: subscription.id,
+    status,
+    cancelAtPeriodEnd: subscriptionDocument.cancelAtPeriodEnd,
+    currentPeriodEnd: subscriptionDocument.currentPeriodEnd,
+  });
+
+  return true;
+};
+
+type SubscriptionState = {
+  isPremium: boolean;
+  status: string;
+  planName: string;
+  cancelAtPeriodEnd: boolean;
+  currentPeriodEnd: Date | null;
+};
+
+// Derives the user-facing subscription state from stored Stripe data.
+// Premium access requires a backend-confirmed active status AND a future
+// current period end — never a query parameter or client-supplied value.
+const deriveSubscriptionState = (
+  subscription: Document | null,
+  role: string,
+): SubscriptionState => {
+  const fallbackPlanName =
+    role === "seeker" ? "Seeker Premium" : "Recruiter Premium";
+
+  if (!subscription) {
+    return {
+      isPremium: false,
+      status: "inactive",
+      planName: "Free",
+      cancelAtPeriodEnd: false,
+      currentPeriodEnd: null,
+    };
+  }
+
+  const currentPeriodEnd = subscription.currentPeriodEnd
+    ? new Date(subscription.currentPeriodEnd)
+    : null;
+
+  const periodIsValid =
+    currentPeriodEnd !== null &&
+    !Number.isNaN(currentPeriodEnd.getTime()) &&
+    currentPeriodEnd.getTime() > Date.now();
+
+  const storedStatus = String(subscription.status || "");
+  const cancelAtPeriodEnd = Boolean(subscription.cancelAtPeriodEnd);
+
+  const isPremium = periodIsValid && storedStatus === "active";
+
+  let status: string;
+
+  if (!periodIsValid) {
+    // No future paid period means no access, whether Stripe calls the
+    // subscription canceled, unpaid, incomplete_expired, or simply stale.
+    status = "expired";
+  } else if (storedStatus === "active") {
+    // A subscription set to cancel keeps Premium until the period ends.
+    status = cancelAtPeriodEnd ? "canceled" : "active";
+  } else {
+    status = storedStatus || "inactive";
+  }
+
+  return {
+    isPremium,
+    status,
+    planName: isPremium
+      ? String(subscription.planName || fallbackPlanName)
+      : "Free",
+    cancelAtPeriodEnd: isPremium && cancelAtPeriodEnd,
+    currentPeriodEnd,
+  };
+};
+
+// ====================================
 // HOME API
-// ------------------------------------
+// ====================================
 
 app.get("/", (_req: Request, res: Response) => {
   res.send("HireLoop Server Running");
 });
 
-// ------------------------------------
+// ====================================
+// STRIPE WEBHOOK
+// MUST BE BEFORE express.json()
+// ====================================
+
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req: Request, res: Response) => {
+    const signature = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!signature || !webhookSecret) {
+      console.error("STRIPE WEBHOOK CONFIG ERROR:", {
+        hasSignature: Boolean(signature),
+        hasWebhookSecret: Boolean(webhookSecret),
+      });
+
+      res.status(400).send("Missing Stripe signature or webhook secret");
+      return;
+    }
+
+    let event: Stripe.Event;
+
+    try {
+      event = getStripe().webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret,
+      );
+    } catch (error) {
+      console.error("STRIPE SIGNATURE ERROR:", error);
+
+      res.status(400).send("Invalid webhook signature");
+      return;
+    }
+
+    console.log("STRIPE WEBHOOK RECEIVED:", event.type, event.id);
+
+    try {
+      // Atomically claim the event before processing it. Concurrent duplicate
+      // deliveries will see the existing claim and exit above, while a failed
+      // processing attempt releases the claim so Stripe can retry.
+      const claim = await stripeEventsCollection.updateOne(
+        { eventId: event.id },
+        {
+          $setOnInsert: {
+            eventId: event.id,
+            eventType: event.type,
+            processedAt: new Date(),
+          },
+        },
+        { upsert: true },
+      );
+
+      if (claim.upsertedCount === 0) {
+        res.status(200).json({
+          received: true,
+          duplicate: true,
+        });
+        return;
+      }
+
+      switch (event.type) {
+        // ====================================
+        // CHECKOUT COMPLETED
+        // ====================================
+
+        case "checkout.session.completed": {
+          const session = event.data.object as Stripe.Checkout.Session;
+
+          if (session.mode !== "subscription" || !session.subscription) {
+            break;
+          }
+
+          const subscriptionId =
+            typeof session.subscription === "string"
+              ? session.subscription
+              : session.subscription.id;
+
+          const subscription =
+            await getStripe().subscriptions.retrieve(subscriptionId);
+
+          await saveStripeSubscription(subscription, {
+            userId:
+              session.metadata?.userId || session.client_reference_id || "",
+            role: session.metadata?.role || "",
+          });
+
+          console.log("CHECKOUT COMPLETED:", subscriptionId);
+
+          break;
+        }
+
+        // ====================================
+        // SUBSCRIPTION CREATED / UPDATED
+        // ====================================
+
+        case "customer.subscription.created":
+        case "customer.subscription.updated": {
+          const subscription = event.data.object as Stripe.Subscription;
+
+          await saveStripeSubscription(subscription);
+
+          console.log(
+            "SUBSCRIPTION EVENT PROCESSED:",
+            event.type,
+            subscription.id,
+          );
+
+          break;
+        }
+
+        // ====================================
+        // SUBSCRIPTION DELETED
+        // ====================================
+
+        case "customer.subscription.deleted": {
+          const subscription = event.data.object as Stripe.Subscription;
+
+          await saveStripeSubscription(subscription);
+
+          console.log("SUBSCRIPTION CANCELED:", subscription.id);
+
+          break;
+        }
+
+        default: {
+          console.log("UNHANDLED STRIPE EVENT:", event.type);
+          break;
+        }
+      }
+
+      res.status(200).json({
+        received: true,
+      });
+    } catch (error) {
+      console.error("STRIPE WEBHOOK PROCESSING ERROR:", error);
+
+      // Release the claim so Stripe's retry can process this event again.
+      try {
+        await stripeEventsCollection.deleteOne({ eventId: event.id });
+      } catch (cleanupError) {
+        console.error("STRIPE WEBHOOK CLAIM CLEANUP ERROR:", cleanupError);
+      }
+
+      res.status(500).json({
+        success: false,
+        message: "Webhook processing failed",
+      });
+    }
+  },
+);
+
+// JSON middleware must remain after Stripe webhook.
+app.use(express.json());
+
+// ====================================
 // GET ALL JOBS
-// ------------------------------------
+// ====================================
 
 app.get("/api/jobs", async (_req: Request, res: Response) => {
   try {
-    const jobs = await jobsCollection.find().sort({ createdAt: -1 }).toArray();
+    const jobs = await jobsCollection
+      .find()
+      .sort({
+        createdAt: -1,
+      })
+      .toArray();
 
     const jobsWithApplicants = await Promise.all(
       jobs.map(async (job) => {
@@ -114,15 +595,15 @@ app.get("/api/jobs", async (_req: Request, res: Response) => {
   }
 });
 
-// ------------------------------------
-// GET SINGLE JOB BY ID
-// ------------------------------------
+// ====================================
+// GET SINGLE JOB
+// ====================================
 
 app.get("/api/jobs/:id", async (req: Request, res: Response) => {
   try {
-    const id = req.params.id;
+    const id = getJobId(req);
 
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    if (!id) {
       res.status(400).json({
         success: false,
         message: "Invalid job ID",
@@ -163,259 +644,324 @@ app.get("/api/jobs/:id", async (req: Request, res: Response) => {
   }
 });
 
-// ------------------------------------
-// POST CREATE JOB
-// ------------------------------------
+// ====================================
+// CREATE JOB
+// ====================================
 
-app.post("/api/jobs", async (req: Request, res: Response) => {
-  try {
-    const {
-      title,
-      company,
-      location,
-      salary,
-      category,
-      description,
-      status = "active",
-    } = req.body;
+app.post(
+  "/api/jobs",
+  verifyUser,
+  verifyRecruiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+      const ownerEmail = user.email;
 
-    if (
-      typeof title !== "string" ||
-      !title.trim() ||
-      typeof company !== "string" ||
-      !company.trim() ||
-      typeof location !== "string" ||
-      !location.trim()
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Title, company and location are required",
-      });
-      return;
-    }
+      const {
+        title,
+        company,
+        location,
+        salary,
+        category,
+        description,
+        status = "active",
+      } = req.body;
 
-    if (!["active", "draft"].includes(status)) {
-      res.status(400).json({
-        success: false,
-        message: "Status must be active or draft",
-      });
-      return;
-    }
-
-    // Temporary owner information from frontend headers.
-    // Replace with verified identity before production.
-
-    const recruiterId = req.header("x-user-id") || "";
-    const ownerEmail = req.header("x-user-email")?.trim().toLowerCase() || "";
-
-    if (!ownerEmail) {
-      res.status(401).json({
-        success: false,
-        message: "Recruiter email is required",
-      });
-      return;
-    }
-
-    const newJob = {
-      title: title.trim(),
-      company: company.trim(),
-      location: location.trim(),
-      salary: typeof salary === "string" ? salary.trim() : "",
-      category: typeof category === "string" ? category.trim() : "",
-      description: typeof description === "string" ? description.trim() : "",
-      status,
-      closed: status === "draft",
-      recruiterId,
-      ownerEmail,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await jobsCollection.insertOne(newJob);
-
-    res.status(201).json({
-      success: true,
-      message:
-        status === "draft"
-          ? "Job saved as draft"
-          : "Job published successfully",
-      data: {
-        _id: result.insertedId,
-        ...newJob,
-      },
-    });
-  } catch (error) {
-    console.error("CREATE JOB ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to create job",
-    });
-  }
-});
-
-// ------------------------------------
-// PATCH UPDATE JOB
-// ------------------------------------
-
-app.patch("/api/jobs/:id", async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid job ID",
-      });
-      return;
-    }
-
-    const allowedFields = [
-      "title",
-      "company",
-      "location",
-      "salary",
-      "category",
-      "description",
-      "status",
-      "closed",
-    ];
-
-    const updateData: Document = {};
-
-    for (const field of allowedFields) {
-      if (req.body[field] !== undefined) {
-        updateData[field] = req.body[field];
+      if (
+        typeof title !== "string" ||
+        !title.trim() ||
+        typeof company !== "string" ||
+        !company.trim() ||
+        typeof location !== "string" ||
+        !location.trim()
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "Title, company and location are required",
+        });
+        return;
       }
-    }
 
-    if (
-      updateData.status !== undefined &&
-      !["active", "draft", "closed"].includes(updateData.status)
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid job status",
+      if (!["active", "draft"].includes(status)) {
+        res.status(400).json({
+          success: false,
+          message: "Status must be active or draft",
+        });
+        return;
+      }
+
+      let publishedAt: Date | null = null;
+
+      if (status === "active") {
+        const subscription = await getActiveSubscription(user.id, "recruiter");
+
+        if (!subscription) {
+          const activeJobs = await countActiveJobs(ownerEmail);
+
+          if (activeJobs >= FREE_PUBLISHED_JOB_LIMIT) {
+            res.status(429).json({
+              success: false,
+              code: "PUBLISHED_JOB_LIMIT_REACHED",
+              message:
+                "You have reached your free active job limit. Upgrade your plan to publish more jobs.",
+              limit: FREE_PUBLISHED_JOB_LIMIT,
+              used: activeJobs,
+              remaining: 0,
+            });
+            return;
+          }
+        }
+
+        publishedAt = new Date();
+      }
+
+      const newJob = {
+        title: title.trim(),
+        company: company.trim(),
+        location: location.trim(),
+        salary: typeof salary === "string" ? salary.trim() : "",
+        category: typeof category === "string" ? category.trim() : "",
+        description: typeof description === "string" ? description.trim() : "",
+        status,
+        closed: status === "draft",
+        recruiterId: user.id,
+        ownerEmail,
+        publishedAt,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await jobsCollection.insertOne(newJob);
+
+      res.status(201).json({
+        success: true,
+        message:
+          status === "draft"
+            ? "Job saved as draft"
+            : "Job published successfully",
+        data: {
+          _id: result.insertedId,
+          ...newJob,
+        },
       });
-      return;
-    }
+    } catch (error) {
+      console.error("CREATE JOB ERROR:", error);
 
-    if (updateData.status === "draft") {
-      updateData.closed = true;
-    } else if (updateData.status === "active") {
-      updateData.closed = false;
-    } else if (updateData.status === "closed") {
-      updateData.closed = true;
-    }
-
-    if (
-      updateData.closed !== undefined &&
-      typeof updateData.closed !== "boolean"
-    ) {
-      res.status(400).json({
+      res.status(500).json({
         success: false,
-        message: "Closed must be true or false",
+        message: "Failed to create job",
       });
-      return;
     }
+  },
+);
 
-    if (Object.keys(updateData).length === 0) {
-      res.status(400).json({
+// ====================================
+// UPDATE JOB
+// ====================================
+
+app.patch(
+  "/api/jobs/:id",
+  verifyUser,
+  verifyRecruiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+      const ownerEmail = user.email;
+
+      const id = getJobId(req);
+
+      if (!id) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid job ID",
+        });
+        return;
+      }
+
+      const existingJob = await jobsCollection.findOne({
+        _id: new ObjectId(id),
+        ownerEmail,
+      });
+
+      if (!existingJob) {
+        res.status(404).json({
+          success: false,
+          message: "Job not found or unauthorized",
+        });
+        return;
+      }
+
+      const allowedFields = [
+        "title",
+        "company",
+        "location",
+        "salary",
+        "category",
+        "description",
+        "status",
+      ];
+
+      const updateData: Document = {};
+
+      for (const field of allowedFields) {
+        if (req.body[field] !== undefined) {
+          updateData[field] = req.body[field];
+        }
+      }
+
+      if (
+        updateData.status !== undefined &&
+        !["active", "draft", "closed"].includes(updateData.status)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid job status",
+        });
+        return;
+      }
+
+      const isPublishing =
+        updateData.status === "active" &&
+        !(existingJob.status === "active" && existingJob.closed !== true);
+
+      if (isPublishing) {
+        const subscription = await getActiveSubscription(user.id, "recruiter");
+
+        if (!subscription) {
+          const activeJobs = await countActiveJobs(ownerEmail, id);
+
+          if (activeJobs >= FREE_PUBLISHED_JOB_LIMIT) {
+            res.status(429).json({
+              success: false,
+              code: "PUBLISHED_JOB_LIMIT_REACHED",
+              message:
+                "You have reached your free active job limit. Upgrade your plan to publish more jobs.",
+              limit: FREE_PUBLISHED_JOB_LIMIT,
+              used: activeJobs,
+              remaining: 0,
+            });
+            return;
+          }
+        }
+
+        updateData.publishedAt = new Date();
+      }
+
+      if (updateData.status === "draft") {
+        updateData.closed = true;
+      } else if (updateData.status === "active") {
+        updateData.closed = false;
+      } else if (updateData.status === "closed") {
+        updateData.closed = true;
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        res.status(400).json({
+          success: false,
+          message: "No valid fields to update",
+        });
+        return;
+      }
+
+      updateData.updatedAt = new Date();
+
+      const result = await jobsCollection.updateOne(
+        {
+          _id: new ObjectId(id),
+          ownerEmail,
+        },
+        {
+          $set: updateData,
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Job not found",
+        });
+        return;
+      }
+
+      const updatedJob = await jobsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Job updated successfully",
+        data: updatedJob,
+      });
+    } catch (error) {
+      console.error("UPDATE JOB ERROR:", error);
+
+      res.status(500).json({
         success: false,
-        message: "No valid fields to update",
+        message: "Failed to update job",
       });
-      return;
     }
+  },
+);
 
-    updateData.updatedAt = new Date();
-
-    const result = await jobsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updateData },
-    );
-
-    if (result.matchedCount === 0) {
-      res.status(404).json({
-        success: false,
-        message: "Job not found",
-      });
-      return;
-    }
-
-    const updatedJob = await jobsCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    res.status(200).json({
-      success: true,
-      message: "Job updated successfully",
-      data: updatedJob,
-    });
-  } catch (error) {
-    console.error("UPDATE JOB ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to update job",
-    });
-  }
-});
-
-// ------------------------------------
+// ====================================
 // DELETE JOB
-// ------------------------------------
-
-app.delete("/api/jobs/:id", async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid job ID",
-      });
-      return;
-    }
-
-    const jobObjectId = new ObjectId(id);
-
-    const result = await jobsCollection.deleteOne({
-      _id: jobObjectId,
-    });
-
-    if (result.deletedCount === 0) {
-      res.status(404).json({
-        success: false,
-        message: "Job not found",
-      });
-      return;
-    }
-
-    await savedJobsCollection.deleteMany({
-      jobId: jobObjectId,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: "Job deleted successfully",
-    });
-  } catch (error) {
-    console.error("DELETE JOB ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete job",
-    });
-  }
-});
-
-// ====================================
-// SAVED JOBS APIs
 // ====================================
 
-// ------------------------------------
-// POST SAVE JOB
-// ------------------------------------
+app.delete(
+  "/api/jobs/:id",
+  verifyUser,
+  verifyRecruiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const id = getJobId(req);
+
+      if (!id) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid job ID",
+        });
+        return;
+      }
+
+      const jobObjectId = new ObjectId(id);
+
+      const result = await jobsCollection.deleteOne({
+        _id: jobObjectId,
+        ownerEmail: req.authUser!.email,
+      });
+
+      if (result.deletedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Job not found or unauthorized",
+        });
+        return;
+      }
+
+      await savedJobsCollection.deleteMany({
+        jobId: jobObjectId,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Job deleted successfully",
+      });
+    } catch (error) {
+      console.error("DELETE JOB ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete job",
+      });
+    }
+  },
+);
+
+// ====================================
+// SAVED JOBS
+// ====================================
+
+// SAVE JOB
 
 app.post(
   "/api/saved-jobs",
@@ -448,7 +994,11 @@ app.post(
         return;
       }
 
-      if (job.status === "draft" || job.closed === true) {
+      if (
+        job.status === "draft" ||
+        job.status === "closed" ||
+        job.closed === true
+      ) {
         res.status(400).json({
           success: false,
           message: "This job is not available for saving",
@@ -502,9 +1052,7 @@ app.post(
   },
 );
 
-// ------------------------------------
-// GET USER SAVED JOBS
-// ------------------------------------
+// GET SAVED JOBS
 
 app.get(
   "/api/saved-jobs",
@@ -516,16 +1064,8 @@ app.get(
 
       const savedJobs = await savedJobsCollection
         .aggregate([
-          {
-            $match: {
-              userId: user.id,
-            },
-          },
-          {
-            $sort: {
-              savedAt: -1,
-            },
-          },
+          { $match: { userId: user.id } },
+          { $sort: { savedAt: -1 } },
           {
             $lookup: {
               from: "jobs",
@@ -543,9 +1083,7 @@ app.get(
           {
             $project: {
               _id: 1,
-              jobId: {
-                $toString: "$jobId",
-              },
+              jobId: { $toString: "$jobId" },
               userId: 1,
               userEmail: 1,
               userName: 1,
@@ -579,9 +1117,7 @@ app.get(
   },
 );
 
-// ------------------------------------
 // CHECK SAVED JOB
-// ------------------------------------
 
 app.get(
   "/api/saved-jobs/check/:jobId",
@@ -620,9 +1156,7 @@ app.get(
   },
 );
 
-// ------------------------------------
 // DELETE SAVED JOB
-// ------------------------------------
 
 app.delete(
   "/api/saved-jobs/:jobId",
@@ -670,231 +1204,270 @@ app.delete(
 );
 
 // ====================================
-// APPLICATION APIs
+// APPLICATIONS
 // ====================================
 
-// ------------------------------------
 // CHECK APPLICATION
-// ------------------------------------
-
-app.get("/api/applications/check", async (req: Request, res: Response) => {
-  try {
-    const { jobId, email } = req.query;
-
-    if (
-      typeof jobId !== "string" ||
-      !ObjectId.isValid(jobId) ||
-      typeof email !== "string" ||
-      !email.trim()
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Valid job ID and email are required",
-      });
-      return;
-    }
-
-    const existingApplication = await applicationsCollection.findOne({
-      jobId: new ObjectId(jobId),
-      applicantEmail: email.trim().toLowerCase(),
-    });
-
-    res.status(200).json({
-      success: true,
-      applied: !!existingApplication,
-    });
-  } catch (error) {
-    console.error("CHECK APPLICATION ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to check application",
-    });
-  }
-});
-
-// ------------------------------------
-// POST APPLY FOR A JOB
-// ------------------------------------
-
-app.post("/api/applications", async (req: Request, res: Response) => {
-  try {
-    const { jobId, name, email, experience, resumeUrl, coverLetter } = req.body;
-
-    if (
-      typeof jobId !== "string" ||
-      !ObjectId.isValid(jobId) ||
-      typeof name !== "string" ||
-      !name.trim() ||
-      typeof email !== "string" ||
-      !email.trim()
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Job ID, name and email are required",
-      });
-      return;
-    }
-
-    const job = await jobsCollection.findOne({
-      _id: new ObjectId(jobId),
-    });
-
-    if (!job) {
-      res.status(404).json({
-        success: false,
-        message: "Job not found",
-      });
-      return;
-    }
-
-    if (job.closed === true || job.status === "draft") {
-      res.status(400).json({
-        success: false,
-        message: "This job is no longer accepting applications",
-      });
-      return;
-    }
-
-    const applicantEmail = email.trim().toLowerCase();
-
-    const existingApplication = await applicationsCollection.findOne({
-      jobId: new ObjectId(jobId),
-      applicantEmail,
-    });
-
-    if (existingApplication) {
-      res.status(409).json({
-        success: false,
-        message: "You have already applied for this job",
-      });
-      return;
-    }
-
-    const newApplication = {
-      jobId: new ObjectId(jobId),
-      jobTitle: String(job.title || ""),
-      company: String(job.company || ""),
-      recruiterEmail: String(job.ownerEmail || "").toLowerCase(),
-
-      applicantName: name.trim(),
-      applicantEmail,
-
-      experience: typeof experience === "string" ? experience.trim() : "",
-
-      resumeUrl: typeof resumeUrl === "string" ? resumeUrl.trim() : "",
-
-      coverLetter: typeof coverLetter === "string" ? coverLetter.trim() : "",
-
-      status: "Applied",
-      appliedAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await applicationsCollection.insertOne(newApplication);
-
-    res.status(201).json({
-      success: true,
-      message: "Application submitted successfully",
-      data: {
-        _id: result.insertedId,
-        ...newApplication,
-      },
-    });
-  } catch (error) {
-    console.error("APPLY JOB ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to submit application",
-    });
-  }
-});
-
-// ------------------------------------
-// GET RECRUITER APPLICATIONS
-// ------------------------------------
-
-app.get("/api/applications/recruiter", async (req: Request, res: Response) => {
-  try {
-    const recruiterEmail = req.header("x-user-email")?.trim().toLowerCase();
-
-    if (!recruiterEmail) {
-      res.status(401).json({
-        success: false,
-        message: "Recruiter email is required",
-      });
-      return;
-    }
-
-    const recruiterJobs = await jobsCollection
-      .find({ ownerEmail: recruiterEmail })
-      .project({ _id: 1 })
-      .toArray();
-
-    const jobIds = recruiterJobs.map((job) => job._id);
-
-    if (jobIds.length === 0) {
-      res.status(200).json({
-        success: true,
-        data: [],
-        total: 0,
-      });
-      return;
-    }
-
-    const applications = await applicationsCollection
-      .find({ jobId: { $in: jobIds } })
-      .sort({ appliedAt: -1 })
-      .toArray();
-
-    const data = applications.map((application) => ({
-      id: application._id.toString(),
-      jobId: application.jobId.toString(),
-      name: application.applicantName,
-      email: application.applicantEmail,
-      role: application.jobTitle,
-      applied: application.appliedAt,
-      experience: application.experience || "Not provided",
-      resumeUrl: application.resumeUrl || "",
-      coverLetter: application.coverLetter || "",
-      status: application.status,
-    }));
-
-    res.status(200).json({
-      success: true,
-      data,
-      total: data.length,
-    });
-  } catch (error) {
-    console.error("GET RECRUITER APPLICATIONS ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch applications",
-    });
-  }
-});
-
-// ------------------------------------
-// GET APPLICANTS FOR A SPECIFIC JOB
-// ------------------------------------
 
 app.get(
-  "/api/applications/recruiter/:jobId",
-  async (req: Request, res: Response) => {
+  "/api/applications/check",
+  verifyUser,
+  verifySeeker,
+  async (req: AuthRequest, res: Response) => {
     try {
-      const { jobId } = req.params;
+      const { jobId } = req.query;
+      const user = req.authUser!;
 
-      const recruiterEmail = req.header("x-user-email")?.trim().toLowerCase();
-
-      if (!recruiterEmail) {
-        res.status(401).json({
+      if (typeof jobId !== "string" || !ObjectId.isValid(jobId)) {
+        res.status(400).json({
           success: false,
-          message: "Recruiter email is required",
+          message: "A valid job ID is required",
         });
         return;
       }
+
+      const existingApplication = await applicationsCollection.findOne({
+        jobId: new ObjectId(jobId),
+        $or: [{ applicantUserId: user.id }, { applicantEmail: user.email }],
+      });
+
+      res.status(200).json({
+        success: true,
+        applied: Boolean(existingApplication),
+      });
+    } catch (error) {
+      console.error("CHECK APPLICATION ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to check application",
+      });
+    }
+  },
+);
+
+// APPLY FOR JOB
+
+app.post(
+  "/api/applications",
+  verifyUser,
+  verifySeeker,
+  async (req: AuthRequest, res: Response) => {
+    const user = req.authUser!;
+    let reserved = false;
+
+    try {
+      const { jobId, experience, resumeUrl, coverLetter } = req.body;
+
+      if (typeof jobId !== "string" || !ObjectId.isValid(jobId)) {
+        res.status(400).json({
+          success: false,
+          message: "A valid job ID is required",
+        });
+        return;
+      }
+
+      const jobObjectId = new ObjectId(jobId);
+
+      const job = await jobsCollection.findOne({
+        _id: jobObjectId,
+      });
+
+      if (!job) {
+        res.status(404).json({
+          success: false,
+          message: "Job not found",
+        });
+        return;
+      }
+
+      if (
+        job.closed === true ||
+        job.status === "draft" ||
+        job.status === "closed"
+      ) {
+        res.status(400).json({
+          success: false,
+          message: "This job is no longer accepting applications",
+        });
+        return;
+      }
+
+      const existingApplication = await applicationsCollection.findOne({
+        jobId: jobObjectId,
+        $or: [{ applicantUserId: user.id }, { applicantEmail: user.email }],
+      });
+
+      if (existingApplication) {
+        res.status(409).json({
+          success: false,
+          message: "You have already applied for this job",
+        });
+        return;
+      }
+
+      const subscription = await getActiveSubscription(user.id, "seeker");
+
+      const isPremium = Boolean(subscription);
+
+      const slotReserved = await reserveApplicationSlot(
+        user.id,
+        user.email,
+        isPremium,
+      );
+
+      if (!slotReserved) {
+        const usage = await applicationUsageCollection.findOne({
+          userId: user.id,
+        });
+
+        res.status(429).json({
+          success: false,
+          code: "APPLICATION_LIMIT_REACHED",
+          message:
+            "You have reached your free application limit. Upgrade your plan to continue.",
+          limit: FREE_APPLICATION_LIMIT,
+          used: Number(usage?.applicationsUsed ?? FREE_APPLICATION_LIMIT),
+        });
+        return;
+      }
+
+      reserved = true;
+
+      const newApplication = {
+        jobId: jobObjectId,
+        jobTitle: String(job.title || ""),
+        company: String(job.company || ""),
+        recruiterEmail: String(job.ownerEmail || "").toLowerCase(),
+        applicantUserId: user.id,
+        applicantName: user.name,
+        applicantEmail: user.email,
+        experience: typeof experience === "string" ? experience.trim() : "",
+        resumeUrl: typeof resumeUrl === "string" ? resumeUrl.trim() : "",
+        coverLetter: typeof coverLetter === "string" ? coverLetter.trim() : "",
+        status: "Applied",
+        appliedAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await applicationsCollection.insertOne(newApplication);
+
+      reserved = false;
+
+      res.status(201).json({
+        success: true,
+        message: "Application submitted successfully",
+        data: {
+          _id: result.insertedId,
+          ...newApplication,
+        },
+      });
+    } catch (error) {
+      if (reserved) {
+        try {
+          await releaseApplicationSlot(user.id);
+        } catch (releaseError) {
+          console.error("RELEASE APPLICATION SLOT ERROR:", releaseError);
+        }
+      }
+
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === 11000
+      ) {
+        res.status(409).json({
+          success: false,
+          message: "You have already applied for this job",
+        });
+        return;
+      }
+
+      console.error("APPLY JOB ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to submit application",
+      });
+    }
+  },
+);
+
+// ====================================
+// RECRUITER APPLICATIONS
+// ====================================
+
+// GET ALL RECRUITER APPLICATIONS
+
+app.get(
+  "/api/applications/recruiter",
+  verifyUser,
+  verifyRecruiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const recruiter = req.authUser!;
+
+      const recruiterJobs = await jobsCollection
+        .find({ ownerEmail: recruiter.email })
+        .project({ _id: 1 })
+        .toArray();
+
+      const jobIds = recruiterJobs.map((job) => job._id);
+
+      if (jobIds.length === 0) {
+        res.status(200).json({
+          success: true,
+          data: [],
+          total: 0,
+        });
+        return;
+      }
+
+      const applications = await applicationsCollection
+        .find({ jobId: { $in: jobIds } })
+        .sort({ appliedAt: -1 })
+        .toArray();
+
+      const data = applications.map((application) => ({
+        id: application._id.toString(),
+        jobId: application.jobId.toString(),
+        name: application.applicantName,
+        email: application.applicantEmail,
+        role: application.jobTitle,
+        applied: application.appliedAt,
+        experience: application.experience || "Not provided",
+        resumeUrl: application.resumeUrl || "",
+        coverLetter: application.coverLetter || "",
+        status: application.status,
+      }));
+
+      res.status(200).json({
+        success: true,
+        data,
+        total: data.length,
+      });
+    } catch (error) {
+      console.error("GET RECRUITER APPLICATIONS ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch applications",
+      });
+    }
+  },
+);
+
+// GET APPLICANTS FOR SPECIFIC JOB
+
+app.get(
+  "/api/applications/recruiter/:jobId",
+  verifyUser,
+  verifyRecruiter,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { jobId } = req.params;
+      const recruiter = req.authUser!;
 
       if (typeof jobId !== "string" || !ObjectId.isValid(jobId)) {
         res.status(400).json({
@@ -906,13 +1479,13 @@ app.get(
 
       const job = await jobsCollection.findOne({
         _id: new ObjectId(jobId),
-        ownerEmail: recruiterEmail,
+        ownerEmail: recruiter.email,
       });
 
       if (!job) {
         res.status(404).json({
           success: false,
-          message: "Job not found or you do not have permission to view it",
+          message: "Job not found or unauthorized",
         });
         return;
       }
@@ -957,17 +1530,16 @@ app.get(
   },
 );
 
-// ------------------------------------
-// PATCH APPLICATION STATUS
-// ------------------------------------
+// UPDATE APPLICATION STATUS
 
 app.patch(
   "/api/applications/:id/status",
-  async (req: Request, res: Response) => {
+  verifyUser,
+  verifyRecruiter,
+  async (req: AuthRequest, res: Response) => {
     try {
-      const id = req.params.id;
-
-      const recruiterEmail = req.header("x-user-email")?.trim().toLowerCase();
+      const id = getJobId(req);
+      const recruiter = req.authUser!;
 
       const allowedStatuses = [
         "Applied",
@@ -979,18 +1551,10 @@ app.patch(
 
       const { status } = req.body;
 
-      if (typeof id !== "string" || !ObjectId.isValid(id)) {
+      if (!id) {
         res.status(400).json({
           success: false,
           message: "Invalid application ID",
-        });
-        return;
-      }
-
-      if (!recruiterEmail) {
-        res.status(401).json({
-          success: false,
-          message: "Recruiter email is required",
         });
         return;
       }
@@ -1017,7 +1581,7 @@ app.patch(
 
       const job = await jobsCollection.findOne({
         _id: application.jobId,
-        ownerEmail: recruiterEmail,
+        ownerEmail: recruiter.email,
       });
 
       if (!job) {
@@ -1053,9 +1617,514 @@ app.patch(
   },
 );
 
-// ------------------------------------
+// ====================================
+// BILLING SUMMARY
+// ====================================
+
+app.get(
+  "/api/billing/summary",
+  verifyUser,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+
+      if (!["seeker", "recruiter"].includes(user.role)) {
+        res.status(403).json({
+          success: false,
+          message: "Billing is not available for this role",
+        });
+        return;
+      }
+
+      const latestSubscription = await getLatestSubscription(user.id, user.role);
+
+      const subscriptionState = deriveSubscriptionState(
+        latestSubscription,
+        user.role,
+      );
+
+      const isPremium = subscriptionState.isPremium;
+
+      // SEEKER BILLING
+
+      if (user.role === "seeker") {
+        await ensureApplicationUsageRecord(user.id, user.email);
+
+        const usage = await applicationUsageCollection.findOne({
+          userId: user.id,
+        });
+
+        const applicationsUsed = Number(usage?.applicationsUsed ?? 0);
+
+        res.status(200).json({
+          success: true,
+          data: {
+            role: "seeker",
+            plan: isPremium ? "premium" : "free",
+            planName: subscriptionState.planName,
+            subscriptionStatus: subscriptionState.status,
+            cancelAtPeriodEnd: subscriptionState.cancelAtPeriodEnd,
+            applicationsUsed,
+            applicationLimit: isPremium ? null : FREE_APPLICATION_LIMIT,
+            remainingApplications: isPremium
+              ? null
+              : Math.max(0, FREE_APPLICATION_LIMIT - applicationsUsed),
+            currentPeriodEnd: subscriptionState.currentPeriodEnd,
+          },
+        });
+
+        return;
+      }
+
+      // RECRUITER BILLING
+
+      const publishedJobsUsed = await countActiveJobs(user.email);
+
+      res.status(200).json({
+        success: true,
+        data: {
+          role: "recruiter",
+          plan: isPremium ? "premium" : "free",
+          planName: subscriptionState.planName,
+          subscriptionStatus: subscriptionState.status,
+          cancelAtPeriodEnd: subscriptionState.cancelAtPeriodEnd,
+          publishedJobsUsed,
+          publishedJobLimit: isPremium ? null : FREE_PUBLISHED_JOB_LIMIT,
+          remainingPublishedJobs: isPremium
+            ? null
+            : Math.max(0, FREE_PUBLISHED_JOB_LIMIT - publishedJobsUsed),
+          currentPeriodEnd: subscriptionState.currentPeriodEnd,
+        },
+      });
+    } catch (error) {
+      console.error("GET BILLING SUMMARY ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch billing information",
+      });
+    }
+  },
+);
+
+// ====================================
+// STRIPE CHECKOUT SESSION
+// ====================================
+
+const createCheckoutSession = async (
+  req: AuthRequest,
+  res: Response,
+  responseFormat: "standard" | "nested",
+) => {
+  try {
+    const user = req.authUser;
+
+    if (!user) {
+      res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
+      return;
+    }
+
+    if (!["seeker", "recruiter"].includes(user.role)) {
+      res.status(403).json({
+        success: false,
+        message: "Invalid subscription role",
+      });
+      return;
+    }
+
+    const frontendUrl = normalizeOrigin(process.env.FRONTEND_URL);
+
+    if (!frontendUrl) {
+      res.status(500).json({
+        success: false,
+        message: "FRONTEND_URL is not configured",
+      });
+      return;
+    }
+
+    const priceId =
+      user.role === "seeker"
+        ? process.env.STRIPE_SEEKER_PRICE_ID
+        : process.env.STRIPE_RECRUITER_PRICE_ID;
+
+    if (!priceId || !priceId.startsWith("price_")) {
+      res.status(500).json({
+        success: false,
+        message:
+          "Invalid Stripe Price ID. Use a recurring Price ID starting with price_, not a Product ID.",
+      });
+      return;
+    }
+
+    const existingSubscription = await getActiveSubscription(
+      user.id,
+      user.role,
+    );
+
+    if (existingSubscription) {
+      res.status(400).json({
+        success: false,
+        message: "You already have an active subscription",
+      });
+      return;
+    }
+
+    const session = await getStripe().checkout.sessions.create({
+      mode: "subscription",
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
+      customer_email: user.email,
+      client_reference_id: user.id,
+      metadata: {
+        userId: user.id,
+        userEmail: user.email,
+        role: user.role,
+      },
+      subscription_data: {
+        metadata: {
+          userId: user.id,
+          userEmail: user.email,
+          role: user.role,
+        },
+      },
+      success_url:
+        user.role === "recruiter"
+          ? `${frontendUrl}/dashboard/recruiter/billing?success=true`
+          : `${frontendUrl}/dashboard/seeker/billing?success=true`,
+      cancel_url:
+        user.role === "recruiter"
+          ? `${frontendUrl}/dashboard/recruiter/billing?canceled=true`
+          : `${frontendUrl}/dashboard/seeker/billing?canceled=true`,
+    });
+
+    if (!session.url) {
+      throw new Error("Stripe checkout session URL is missing");
+    }
+
+    if (responseFormat === "nested") {
+      res.status(200).json({
+        success: true,
+        data: {
+          url: session.url,
+        },
+      });
+
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      url: session.url,
+    });
+  } catch (error) {
+    console.error("CREATE CHECKOUT SESSION ERROR:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create checkout session",
+    });
+  }
+};
+
+// Original checkout endpoint
+
+app.post(
+  "/api/billing/checkout-session",
+  verifyUser,
+  async (req: AuthRequest, res: Response) => {
+    await createCheckoutSession(req, res, "standard");
+  },
+);
+
+// Frontend-compatible checkout endpoint
+
+app.post(
+  "/api/billing/create-checkout-session",
+  verifyUser,
+  async (req: AuthRequest, res: Response) => {
+    await createCheckoutSession(req, res, "nested");
+  },
+);
+
+// ====================================
+// ADMIN USER MANAGEMENT
+// ====================================
+
+const ADMIN_MANAGED_ROLES = ["seeker", "recruiter", "admin"] as const;
+
+type ManagedRole = (typeof ADMIN_MANAGED_ROLES)[number];
+
+const isManagedRole = (value: unknown): value is ManagedRole =>
+  typeof value === "string" &&
+  (ADMIN_MANAGED_ROLES as readonly string[]).includes(value);
+
+// Accounts without a recognised role are treated as seekers, matching the
+// default used by Better Auth when the user collection was created.
+const normalizeStoredRole = (value: unknown): ManagedRole =>
+  isManagedRole(value) ? value : "seeker";
+
+// Explicit allow-list of user fields that are safe to return to the admin
+// dashboard. Password hashes live in Better Auth's account collection, but the
+// projection guarantees no credential or token field can leak even if the
+// schema changes later.
+const ADMIN_USER_PROJECTION = {
+  name: 1,
+  email: 1,
+  role: 1,
+  emailVerified: 1,
+  image: 1,
+  createdAt: 1,
+  updatedAt: 1,
+} as const;
+
+type AdminUserView = {
+  id: string;
+  name: string;
+  email: string;
+  role: ManagedRole;
+  emailVerified: boolean;
+  image: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+const toIsoString = (value: unknown): string | null => {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+
+  return null;
+};
+
+const sanitizeAdminUser = (user: Document): AdminUserView => ({
+  id: String(user._id),
+  name: String(user.name || "").trim() || "Unnamed user",
+  email: String(user.email || "")
+    .trim()
+    .toLowerCase(),
+  role: normalizeStoredRole(user.role),
+  emailVerified: Boolean(user.emailVerified),
+  image: typeof user.image === "string" && user.image ? user.image : null,
+  createdAt: toIsoString(user.createdAt),
+  updatedAt: toIsoString(user.updatedAt),
+});
+
+const escapeRegex = (value: string) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+app.get(
+  "/api/admin/users",
+  verifyUser,
+  verifyAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const rawPage = Number(req.query.page ?? 1);
+      const rawLimit = Number(req.query.limit ?? 10);
+
+      const page = Number.isFinite(rawPage)
+        ? Math.max(1, Math.floor(rawPage))
+        : 1;
+
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(100, Math.max(1, Math.floor(rawLimit)))
+        : 10;
+
+      const search =
+        typeof req.query.search === "string" ? req.query.search.trim() : "";
+
+      const roleParam =
+        typeof req.query.role === "string"
+          ? req.query.role.trim().toLowerCase()
+          : "all";
+
+      if (roleParam !== "all" && !isManagedRole(roleParam)) {
+        res.status(400).json({
+          success: false,
+          message: "Role filter must be one of all, seeker, recruiter, or admin",
+        });
+        return;
+      }
+
+      if (search.length > 120) {
+        res.status(400).json({
+          success: false,
+          message: "Search query is too long",
+        });
+        return;
+      }
+
+      const filter: Document = {};
+
+      if (roleParam !== "all") {
+        // Match case-insensitively so the list agrees with the aggregated
+        // role counts, which lowercase every stored role.
+        filter.role = { $regex: `^${roleParam}$`, $options: "i" };
+      }
+
+      if (search) {
+        const pattern = new RegExp(escapeRegex(search), "i");
+
+        filter.$or = [{ name: pattern }, { email: pattern }];
+      }
+
+      const [total, users, roleCounts, totalUsers] = await Promise.all([
+        usersCollection.countDocuments(filter),
+        usersCollection
+          .find(filter, { projection: ADMIN_USER_PROJECTION })
+          .sort({ createdAt: -1, _id: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+        usersCollection
+          .aggregate([
+            {
+              $group: {
+                _id: { $toLower: { $ifNull: ["$role", ""] } },
+                count: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray(),
+        usersCollection.countDocuments({}),
+      ]);
+
+      const countFor = (role: string) =>
+        Number(
+          roleCounts.find((entry) => String(entry._id) === role)?.count ?? 0,
+        );
+
+      const recruiters = countFor("recruiter");
+      const admins = countFor("admin");
+      const seekers = Math.max(0, totalUsers - recruiters - admins);
+
+      res.status(200).json({
+        success: true,
+        data: {
+          users: users.map(sanitizeAdminUser),
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.max(1, Math.ceil(total / limit)),
+          },
+          counts: {
+            total: totalUsers,
+            seekers,
+            recruiters,
+            admins,
+          },
+        },
+      });
+    } catch (error) {
+      console.error("ADMIN LIST USERS ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to load users",
+      });
+    }
+  },
+);
+
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyUser,
+  verifyAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const admin = req.authUser!;
+      const targetId = req.params.id;
+
+      if (typeof targetId !== "string" || !ObjectId.isValid(targetId)) {
+        res.status(400).json({
+          success: false,
+          message: "A valid user ID is required",
+        });
+        return;
+      }
+
+      const requestedRole =
+        typeof req.body?.role === "string"
+          ? req.body.role.trim().toLowerCase()
+          : "";
+
+      if (!isManagedRole(requestedRole)) {
+        res.status(400).json({
+          success: false,
+          message: "Role must be one of seeker, recruiter, or admin",
+        });
+        return;
+      }
+
+      // An admin can never demote themselves, which would lock the console.
+      if (admin.id === targetId && requestedRole !== "admin") {
+        res.status(400).json({
+          success: false,
+          message: "You cannot remove your own admin role",
+        });
+        return;
+      }
+
+      const updated = await usersCollection.findOneAndUpdate(
+        { _id: new ObjectId(targetId) },
+        {
+          $set: {
+            role: requestedRole,
+            updatedAt: new Date(),
+          },
+        },
+        {
+          returnDocument: "after",
+          projection: ADMIN_USER_PROJECTION,
+        },
+      );
+
+      if (!updated) {
+        res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+        return;
+      }
+
+      console.log("ADMIN ROLE UPDATED:", {
+        adminId: admin.id,
+        targetUserId: targetId,
+        role: requestedRole,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "User role updated successfully",
+        data: sanitizeAdminUser(updated),
+      });
+    } catch (error) {
+      console.error("ADMIN UPDATE USER ROLE ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to update user role",
+      });
+    }
+  },
+);
+
+// ====================================
 // ERROR HANDLER
-// ------------------------------------
+// ====================================
 
 app.use(
   (error: Error, _req: Request, res: Response, _next: express.NextFunction) => {
@@ -1076,9 +2145,9 @@ app.use(
   },
 );
 
-// ------------------------------------
+// ====================================
 // START SERVER
-// ------------------------------------
+// ====================================
 
 const startServer = async () => {
   try {
@@ -1087,9 +2156,79 @@ const startServer = async () => {
     jobsCollection = db.collection("jobs");
     applicationsCollection = db.collection("applications");
     savedJobsCollection = db.collection("savedJobs");
+    subscriptionsCollection = db.collection("subscriptions");
+    applicationUsageCollection = db.collection("applicationUsage");
+    stripeEventsCollection = db.collection("stripeEvents");
+    usersCollection = db.collection("user");
+
+    // ====================================
+    // APPLICATION INDEXES
+    // ====================================
+
+    await applicationsCollection.createIndex(
+      {
+        jobId: 1,
+        applicantUserId: 1,
+      },
+      {
+        unique: true,
+        partialFilterExpression: {
+          applicantUserId: { $type: "string" },
+        },
+      },
+    );
+
+    await applicationsCollection.createIndex({
+      applicantUserId: 1,
+      appliedAt: -1,
+    });
+
+    // ====================================
+    // USAGE INDEXES
+    // ====================================
+
+    await applicationUsageCollection.createIndex(
+      { userId: 1 },
+      { unique: true },
+    );
+
+    // ====================================
+    // JOB INDEXES
+    // ====================================
+
+    await jobsCollection.createIndex({
+      ownerEmail: 1,
+      status: 1,
+      closed: 1,
+    });
+
+    // ====================================
+    // SUBSCRIPTION INDEXES
+    // ====================================
+
+    await subscriptionsCollection.createIndex(
+      { stripeSubscriptionId: 1 },
+      {
+        unique: true,
+        sparse: true,
+      },
+    );
+
+    await subscriptionsCollection.createIndex({
+      userId: 1,
+      role: 1,
+      status: 1,
+    });
+
+    // ====================================
+    // SAVED JOBS INDEXES
+    // ====================================
 
     await savedJobsCollection.createIndex(
-      { jobId: 1, userId: 1 },
+      {
+        jobId: 1,
+        userId: 1,
+      },
       { unique: true },
     );
 
@@ -1098,15 +2237,36 @@ const startServer = async () => {
       savedAt: -1,
     });
 
+    // ====================================
+    // STRIPE WEBHOOK INDEX
+    // ====================================
+
+    await stripeEventsCollection.createIndex({ eventId: 1 }, { unique: true });
+
+    // ====================================
+    // ADMIN USERS INDEXES
+    // ====================================
+
+    // Supports the admin user list sorted newest-first and filtered by role.
+    // The `user` collection is owned by Better Auth; this only adds a
+    // non-unique index and never changes its schema.
+    await usersCollection.createIndex({ role: 1, createdAt: -1 });
+    await usersCollection.createIndex({ createdAt: -1 });
+
     console.log("MongoDB collections connected successfully");
-    console.log("Saved Jobs indexes created successfully");
+    console.log("Seeker application limit: 5");
+    console.log("Recruiter active job limit: 5");
+    console.log("Recruiter Premium: Unlimited active jobs");
+    console.log("Stripe subscription indexes ready");
+    console.log("Stripe webhook event index ready");
+    console.log("Saved Jobs indexes ready");
 
     app.listen(PORT, () => {
       console.log(`HireLoop server running on port ${PORT}`);
       console.log("Allowed frontend origins:", allowedOrigins);
     });
   } catch (error) {
-    console.error("Server startup failed:", error);
+    console.error("SERVER STARTUP FAILED:", error);
     process.exit(1);
   }
 };
