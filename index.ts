@@ -672,13 +672,22 @@ app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
   async (req: Request, res: Response) => {
-    const signature = req.headers["stripe-signature"];
+    const signatureHeader = req.headers["stripe-signature"];
+    const signature = Array.isArray(signatureHeader)
+      ? signatureHeader[0]
+      : signatureHeader;
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
+    console.info("STRIPE WEBHOOK: request received", {
+      path: req.path,
+      hasSignatureHeader: Boolean(signature),
+      hasWebhookSecretConfigured: Boolean(webhookSecret),
+    });
+
     if (!signature || !webhookSecret) {
-      console.error("STRIPE WEBHOOK CONFIG ERROR:", {
-        hasSignature: Boolean(signature),
-        hasWebhookSecret: Boolean(webhookSecret),
+      console.error("STRIPE WEBHOOK: signature/config missing", {
+        hasSignatureHeader: Boolean(signature),
+        hasWebhookSecretConfigured: Boolean(webhookSecret),
       });
 
       res.status(400).send("Missing Stripe signature or webhook secret");
@@ -693,14 +702,25 @@ app.post(
         signature,
         webhookSecret,
       );
+      console.info("STRIPE WEBHOOK: signature verification succeeded", {
+        eventId: event.id,
+        eventType: event.type,
+      });
     } catch (error) {
-      console.error("STRIPE SIGNATURE ERROR:", error);
+      console.error("STRIPE WEBHOOK: signature verification failed", {
+        message: error instanceof Error ? error.message : "unknown error",
+      });
 
       res.status(400).send("Invalid webhook signature");
       return;
     }
 
-    console.log("STRIPE WEBHOOK RECEIVED:", event.type, event.id);
+    console.info("STRIPE WEBHOOK: event received", {
+      eventId: event.id,
+      eventType: event.type,
+    });
+
+    let claimed = false;
 
     try {
       // Atomically claim the event before processing it. Concurrent duplicate
@@ -712,19 +732,44 @@ app.post(
           $setOnInsert: {
             eventId: event.id,
             eventType: event.type,
-            processedAt: new Date(),
+            receivedAt: new Date(),
           },
         },
         { upsert: true },
       );
 
       if (claim.upsertedCount === 0) {
+        console.info("STRIPE WEBHOOK: duplicate event skipped", {
+          eventId: event.id,
+          eventType: event.type,
+        });
         res.status(200).json({
           received: true,
           duplicate: true,
         });
         return;
       }
+
+      claimed = true;
+      console.info("STRIPE WEBHOOK: processing started", {
+        eventId: event.id,
+        eventType: event.type,
+      });
+
+      let syncResult: boolean | null = null;
+
+      const requireSync = (result: boolean, context: Record<string, unknown>) => {
+        console.info("STRIPE WEBHOOK: mongodb subscription sync result", {
+          eventId: event.id,
+          eventType: event.type,
+          success: result,
+          ...context,
+        });
+
+        if (!result) {
+          throw new Error("Subscription sync did not update a mapped user/subscription record");
+        }
+      };
 
       switch (event.type) {
         // ====================================
@@ -735,13 +780,18 @@ app.post(
           const session = event.data.object as Stripe.Checkout.Session;
 
           if (session.mode !== "subscription" || !session.subscription) {
+            console.info("STRIPE WEBHOOK: checkout session ignored (not subscription)", {
+              eventId: event.id,
+              mode: session.mode,
+              hasSubscription: Boolean(session.subscription),
+            });
             break;
           }
 
           const subscriptionId = getStripeObjectId(session.subscription);
 
           if (!subscriptionId) {
-            break;
+            throw new Error("checkout.session.completed missing subscription ID");
           }
 
           const subscription = await getStripe().subscriptions.retrieve(
@@ -749,15 +799,18 @@ app.post(
             { expand: ["items.data.price"] },
           );
 
-          await saveStripeSubscription(subscription, {
+          syncResult = await saveStripeSubscription(subscription, {
             userId:
               session.metadata?.userId || session.client_reference_id || "",
             role: session.metadata?.role || "",
             planId: session.metadata?.planId || "",
           });
 
-          console.log("CHECKOUT COMPLETED:", subscriptionId);
-
+          requireSync(syncResult, {
+            subscriptionId,
+            hasClientReferenceId: Boolean(session.client_reference_id),
+            metadataKeys: Object.keys(session.metadata || {}),
+          });
           break;
         }
 
@@ -773,14 +826,8 @@ app.post(
             { expand: ["items.data.price"] },
           );
 
-          await saveStripeSubscription(subscription);
-
-          console.log(
-            "SUBSCRIPTION EVENT PROCESSED:",
-            event.type,
-            subscription.id,
-          );
-
+          syncResult = await saveStripeSubscription(subscription);
+          requireSync(syncResult, { subscriptionId: subscription.id });
           break;
         }
 
@@ -795,10 +842,8 @@ app.post(
             { expand: ["items.data.price"] },
           );
 
-          await saveStripeSubscription(subscription);
-
-          console.log("SUBSCRIPTION CANCELED:", subscription.id);
-
+          syncResult = await saveStripeSubscription(subscription);
+          requireSync(syncResult, { subscriptionId: subscription.id });
           break;
         }
 
@@ -814,6 +859,10 @@ app.post(
           const subscriptionId = getStripeObjectId(invoiceData.subscription);
 
           if (!subscriptionId) {
+            console.info("STRIPE WEBHOOK: invoice.paid ignored (no subscription)", {
+              eventId: event.id,
+              invoiceId: invoice.id,
+            });
             break;
           }
 
@@ -822,10 +871,8 @@ app.post(
             { expand: ["items.data.price"] },
           );
 
-          await saveStripeSubscription(subscription);
-
-          console.log("INVOICE PAID:", invoice.id, subscriptionId);
-
+          syncResult = await saveStripeSubscription(subscription);
+          requireSync(syncResult, { subscriptionId, invoiceId: invoice.id });
           break;
         }
 
@@ -841,6 +888,10 @@ app.post(
           const subscriptionId = getStripeObjectId(invoiceData.subscription);
 
           if (!subscriptionId) {
+            console.info("STRIPE WEBHOOK: invoice.payment_failed ignored (no subscription)", {
+              eventId: event.id,
+              invoiceId: invoice.id,
+            });
             break;
           }
 
@@ -849,30 +900,55 @@ app.post(
             { expand: ["items.data.price"] },
           );
 
-          await saveStripeSubscription(subscription);
-
-          console.log("INVOICE PAYMENT FAILED:", invoice.id, subscriptionId);
-
+          syncResult = await saveStripeSubscription(subscription);
+          requireSync(syncResult, { subscriptionId, invoiceId: invoice.id });
           break;
         }
 
         default: {
-          console.log("UNHANDLED STRIPE EVENT:", event.type);
+          console.info("STRIPE WEBHOOK: unhandled event type", {
+            eventId: event.id,
+            eventType: event.type,
+          });
           break;
         }
       }
+
+      console.info("STRIPE WEBHOOK: processing completed", {
+        eventId: event.id,
+        eventType: event.type,
+        syncAttempted: syncResult !== null,
+        syncSucceeded: syncResult === null ? null : syncResult,
+      });
 
       res.status(200).json({
         received: true,
       });
     } catch (error) {
-      console.error("STRIPE WEBHOOK PROCESSING ERROR:", error);
+      console.error("STRIPE WEBHOOK: processing failed", {
+        eventId: event.id,
+        eventType: event.type,
+        message: error instanceof Error ? error.message : "unknown error",
+      });
 
       // Release the claim so Stripe's retry can process this event again.
-      try {
-        await stripeEventsCollection.deleteOne({ eventId: event.id });
-      } catch (cleanupError) {
-        console.error("STRIPE WEBHOOK CLAIM CLEANUP ERROR:", cleanupError);
+      if (claimed) {
+        try {
+          await stripeEventsCollection.deleteOne({ eventId: event.id });
+          console.info("STRIPE WEBHOOK: event claim released for retry", {
+            eventId: event.id,
+            eventType: event.type,
+          });
+        } catch (cleanupError) {
+          console.error("STRIPE WEBHOOK: claim cleanup failed", {
+            eventId: event.id,
+            eventType: event.type,
+            message:
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : "unknown error",
+          });
+        }
       }
 
       res.status(500).json({
