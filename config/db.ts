@@ -3,8 +3,14 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const uri = process.env.MONGODB_URI!;
-const dbName = process.env.DB_NAME!;
+const uri = process.env.MONGODB_URI;
+const dbName = process.env.DB_NAME || "hireloop";
+
+if (!uri) {
+  throw new Error(
+    "MONGODB_URI is missing. Please configure it in Render Environment Variables.",
+  );
+}
 
 const client = new MongoClient(uri);
 
