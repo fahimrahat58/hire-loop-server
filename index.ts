@@ -958,6 +958,69 @@ app.delete(
 );
 
 // ====================================
+// ADMIN DELETE JOB
+// ====================================
+
+/**
+ * Admin-only job removal.
+ *
+ * `verifyUser` loads the role from MongoDB for every request and `verifyAdmin`
+ * rejects anyone who is not an administrator, so the JWT role claim can never
+ * be used to escalate access. Recruiters keep using DELETE /api/jobs/:id,
+ * which still filters by `ownerEmail` and is therefore restricted to their own
+ * jobs.
+ */
+app.delete(
+  "/api/admin/jobs/:id",
+  verifyUser,
+  verifyAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const id = getJobId(req);
+
+      if (!id) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid job ID",
+        });
+        return;
+      }
+
+      const jobObjectId = new ObjectId(id);
+
+      // Admins are explicitly allowed to remove any listing.
+      const result = await jobsCollection.deleteOne({
+        _id: jobObjectId,
+      });
+
+      if (result.deletedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Job not found",
+        });
+        return;
+      }
+
+      await savedJobsCollection.deleteMany({
+        jobId: jobObjectId,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Job deleted successfully",
+      });
+    } catch (error) {
+      console.error("ADMIN DELETE JOB ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete job",
+      });
+    }
+  },
+);
+
+// ====================================
 // SAVED JOBS
 // ====================================
 
@@ -1636,7 +1699,10 @@ app.get(
         return;
       }
 
-      const latestSubscription = await getLatestSubscription(user.id, user.role);
+      const latestSubscription = await getLatestSubscription(
+        user.id,
+        user.role,
+      );
 
       const subscriptionState = deriveSubscriptionState(
         latestSubscription,
@@ -1854,6 +1920,224 @@ app.post(
 );
 
 // ====================================
+// USER PROFILE IMAGE UPLOAD (IMGBB)
+// ====================================
+
+const PROFILE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+
+const ALLOWED_PROFILE_IMAGE_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+
+type ImgbbUploadResponse = {
+  success?: boolean;
+  data?: {
+    url?: string;
+    display_url?: string;
+  };
+  error?: {
+    message?: string;
+  };
+};
+
+const getBase64Payload = (value: string): string => {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+
+  if (match?.[2]) {
+    return match[2].replace(/\s/g, "");
+  }
+
+  return trimmed.replace(/\s/g, "");
+};
+
+const getDecodedImageSize = (base64: string): number => {
+  const normalized = base64.replace(/\s/g, "");
+  const padding = normalized.endsWith("==")
+    ? 2
+    : normalized.endsWith("=")
+      ? 1
+      : 0;
+
+  return Math.floor((normalized.length * 3) / 4) - padding;
+};
+
+app.post(
+  "/api/users/me/profile-image",
+  verifyUser,
+  express.json({ limit: "8mb" }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.authUser;
+
+      if (!user) {
+        res.status(401).json({
+          success: false,
+          message: "Authentication required",
+        });
+        return;
+      }
+
+      const imgbbApiKey = process.env.IMGBB_API_KEY?.trim();
+
+      if (!imgbbApiKey) {
+        res.status(500).json({
+          success: false,
+          message: "Image upload is not configured on the server",
+        });
+        return;
+      }
+
+      const rawImage = req.body?.image;
+      const rawMimeType = req.body?.mimeType;
+
+      if (typeof rawImage !== "string" || !rawImage.trim()) {
+        res.status(400).json({
+          success: false,
+          message: "A profile image is required",
+        });
+        return;
+      }
+
+      const dataUrlMatch = rawImage
+        .trim()
+        .match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/i);
+
+      const mimeType = (
+        dataUrlMatch?.[1] ||
+        (typeof rawMimeType === "string" ? rawMimeType : "")
+      )
+        .trim()
+        .toLowerCase();
+
+      if (!ALLOWED_PROFILE_IMAGE_MIME_TYPES.has(mimeType)) {
+        res.status(400).json({
+          success: false,
+          message:
+            "Invalid file type. Only JPEG, JPG, PNG, and WebP images are allowed",
+        });
+        return;
+      }
+
+      const base64Payload = getBase64Payload(rawImage);
+
+      if (!base64Payload) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid image data",
+        });
+        return;
+      }
+
+      let imageBuffer: Buffer;
+
+      try {
+        imageBuffer = Buffer.from(base64Payload, "base64");
+      } catch {
+        res.status(400).json({
+          success: false,
+          message: "Invalid image data",
+        });
+        return;
+      }
+
+      if (!imageBuffer.length || getDecodedImageSize(base64Payload) <= 0) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid image data",
+        });
+        return;
+      }
+
+      if (imageBuffer.length > PROFILE_IMAGE_MAX_BYTES) {
+        res.status(413).json({
+          success: false,
+          message: "Image is too large. Maximum allowed size is 5 MB",
+        });
+        return;
+      }
+
+      const uploadBody = new URLSearchParams();
+      uploadBody.set("key", imgbbApiKey);
+      uploadBody.set("image", base64Payload);
+
+      const imgbbResponse = await fetch("https://api.imgbb.com/1/upload", {
+        method: "POST",
+        body: uploadBody,
+      });
+
+      let imgbbPayload: ImgbbUploadResponse | null = null;
+
+      try {
+        imgbbPayload = (await imgbbResponse.json()) as ImgbbUploadResponse;
+      } catch {
+        imgbbPayload = null;
+      }
+
+      if (!imgbbResponse.ok || !imgbbPayload?.success) {
+        const providerMessage =
+          imgbbPayload?.error?.message || "Failed to upload image";
+
+        res.status(502).json({
+          success: false,
+          message: `Image upload failed: ${providerMessage}`,
+        });
+        return;
+      }
+
+      const imageUrl =
+        imgbbPayload.data?.display_url || imgbbPayload.data?.url || "";
+
+      if (!imageUrl) {
+        res.status(502).json({
+          success: false,
+          message: "Image upload failed: no image URL was returned",
+        });
+        return;
+      }
+
+      const userObjectId = new ObjectId(user.id);
+
+      // Update only the authenticated user's existing MongoDB record.
+      const updateResult = await usersCollection.updateOne(
+        { _id: userObjectId },
+        {
+          $set: {
+            image: imageUrl,
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (updateResult.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Profile image updated successfully",
+        data: {
+          image: imageUrl,
+        },
+      });
+    } catch (error) {
+      console.error("PROFILE IMAGE UPLOAD ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to upload profile image",
+      });
+    }
+  },
+);
+
+// ====================================
 // ADMIN USER MANAGEMENT
 // ====================================
 
@@ -1865,10 +2149,9 @@ const isManagedRole = (value: unknown): value is ManagedRole =>
   typeof value === "string" &&
   (ADMIN_MANAGED_ROLES as readonly string[]).includes(value);
 
-// Accounts without a recognised role are treated as seekers, matching the
-// default used by Better Auth when the user collection was created.
-const normalizeStoredRole = (value: unknown): ManagedRole =>
-  isManagedRole(value) ? value : "seeker";
+// Never misrepresent a missing or invalid database role as a seeker.
+const normalizeStoredRole = (value: unknown): ManagedRole | "unknown" =>
+  isManagedRole(value) ? value : "unknown";
 
 // Explicit allow-list of user fields that are safe to return to the admin
 // dashboard. Password hashes live in Better Auth's account collection, but the
@@ -1888,7 +2171,7 @@ type AdminUserView = {
   id: string;
   name: string;
   email: string;
-  role: ManagedRole;
+  role: ManagedRole | "unknown";
   emailVerified: boolean;
   image: string | null;
   createdAt: string | null;
@@ -1953,7 +2236,8 @@ app.get(
       if (roleParam !== "all" && !isManagedRole(roleParam)) {
         res.status(400).json({
           success: false,
-          message: "Role filter must be one of all, seeker, recruiter, or admin",
+          message:
+            "Role filter must be one of all, seeker, recruiter, or admin",
         });
         return;
       }
@@ -2008,7 +2292,7 @@ app.get(
 
       const recruiters = countFor("recruiter");
       const admins = countFor("admin");
-      const seekers = Math.max(0, totalUsers - recruiters - admins);
+      const seekers = countFor("seeker");
 
       res.status(200).json({
         success: true,
@@ -2025,6 +2309,10 @@ app.get(
             seekers,
             recruiters,
             admins,
+            unknownRoles: Math.max(
+              0,
+              totalUsers - seekers - recruiters - admins,
+            ),
           },
         },
       });

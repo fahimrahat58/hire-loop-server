@@ -81,13 +81,25 @@ export const verifyUser = async (
       return;
     }
 
+    const role = String(user.role || "")
+      .trim()
+      .toLowerCase();
+
+    if (!["seeker", "recruiter", "admin"].includes(role)) {
+      res.status(403).json({
+        success: false,
+        message: "Your account does not have a valid role",
+      });
+      return;
+    }
+
     req.authUser = {
       id: String(user._id),
       email: String(user.email || "")
         .trim()
         .toLowerCase(),
       name: String(user.name || ""),
-      role: String(user.role || "seeker").toLowerCase(),
+      role,
     };
 
     if (!req.authUser.email) {
@@ -109,53 +121,31 @@ export const verifyUser = async (
   }
 };
 
-export const verifySeeker = (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-) => {
-  if (req.authUser?.role !== "seeker") {
-    res.status(403).json({
-      success: false,
-      message: "Only job seekers can access this resource",
-    });
-    return;
-  }
+export type UserRole = "seeker" | "recruiter" | "admin";
 
-  next();
+export const verifyRole = (...allowedRoles: UserRole[]) => {
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.authUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (!allowedRoles.includes(req.authUser.role as UserRole)) {
+      res.status(403).json({
+        success: false,
+        message: "You do not have permission to access this resource",
+        requiredRoles: allowedRoles,
+      });
+      return;
+    }
+
+    next();
+  };
 };
 
-export const verifyRecruiter = (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-) => {
-  if (req.authUser?.role !== "recruiter") {
-    res.status(403).json({
-      success: false,
-      message: "Only recruiters can access this resource",
-    });
-    return;
-  }
-
-  next();
-};
-
-// Admin authorization always relies on the role loaded from MongoDB by
-// verifyUser. A role claim from the client, the frontend session or the JWT is
-// never trusted here.
-export const verifyAdmin = (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-) => {
-  if (req.authUser?.role !== "admin") {
-    res.status(403).json({
-      success: false,
-      message: "Only administrators can access this resource",
-    });
-    return;
-  }
-
-  next();
-};
+export const verifySeeker = verifyRole("seeker");
+export const verifyRecruiter = verifyRole("recruiter");
+export const verifyAdmin = verifyRole("admin");
