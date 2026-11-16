@@ -1,4 +1,4 @@
-import { app, initializeApp } from "../index.js";
+import { app, initializeApp } from "../index.ts";
 
 let ready: Promise<void> | null = null;
 
@@ -14,6 +14,15 @@ const ensureReady = () => {
 };
 
 export default async function handler(req: any, res: any) {
-  await ensureReady();
-  return app(req, res);
+  try {
+    await ensureReady();
+    return app(req, res);
+  } catch (error) {
+    console.error("API INITIALIZATION FAILED:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Server initialization failed",
+    });
+  }
 }
