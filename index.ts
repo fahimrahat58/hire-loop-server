@@ -21,6 +21,12 @@ const PORT = process.env.PORT || 5000;
 const FREE_APPLICATION_LIMIT = 5;
 const FREE_PUBLISHED_JOB_LIMIT = 5;
 
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
 // ====================================
 // STRIPE
 // ====================================
@@ -456,7 +462,8 @@ const saveStripeSubscription = async (
   }
 
   const finalPlanId = inferredPlanId || getPlanIdForRole(role);
-  const planDefinition = getPlanDefinition(finalPlanId) || PLAN_DEFINITIONS[getPlanIdForRole(role)];
+  const planDefinition =
+    getPlanDefinition(finalPlanId) || PLAN_DEFINITIONS[getPlanIdForRole(role)];
 
   if (!ObjectId.isValid(userId)) {
     console.warn("STRIPE SUBSCRIPTION SKIPPED (invalid userId):", {
@@ -758,7 +765,10 @@ app.post(
 
       let syncResult: boolean | null = null;
 
-      const requireSync = (result: boolean, context: Record<string, unknown>) => {
+      const requireSync = (
+        result: boolean,
+        context: Record<string, unknown>,
+      ) => {
         console.info("STRIPE WEBHOOK: mongodb subscription sync result", {
           eventId: event.id,
           eventType: event.type,
@@ -767,7 +777,9 @@ app.post(
         });
 
         if (!result) {
-          throw new Error("Subscription sync did not update a mapped user/subscription record");
+          throw new Error(
+            "Subscription sync did not update a mapped user/subscription record",
+          );
         }
       };
 
@@ -780,18 +792,23 @@ app.post(
           const session = event.data.object as Stripe.Checkout.Session;
 
           if (session.mode !== "subscription" || !session.subscription) {
-            console.info("STRIPE WEBHOOK: checkout session ignored (not subscription)", {
-              eventId: event.id,
-              mode: session.mode,
-              hasSubscription: Boolean(session.subscription),
-            });
+            console.info(
+              "STRIPE WEBHOOK: checkout session ignored (not subscription)",
+              {
+                eventId: event.id,
+                mode: session.mode,
+                hasSubscription: Boolean(session.subscription),
+              },
+            );
             break;
           }
 
           const subscriptionId = getStripeObjectId(session.subscription);
 
           if (!subscriptionId) {
-            throw new Error("checkout.session.completed missing subscription ID");
+            throw new Error(
+              "checkout.session.completed missing subscription ID",
+            );
           }
 
           const subscription = await getStripe().subscriptions.retrieve(
@@ -859,10 +876,13 @@ app.post(
           const subscriptionId = getStripeObjectId(invoiceData.subscription);
 
           if (!subscriptionId) {
-            console.info("STRIPE WEBHOOK: invoice.paid ignored (no subscription)", {
-              eventId: event.id,
-              invoiceId: invoice.id,
-            });
+            console.info(
+              "STRIPE WEBHOOK: invoice.paid ignored (no subscription)",
+              {
+                eventId: event.id,
+                invoiceId: invoice.id,
+              },
+            );
             break;
           }
 
@@ -888,10 +908,13 @@ app.post(
           const subscriptionId = getStripeObjectId(invoiceData.subscription);
 
           if (!subscriptionId) {
-            console.info("STRIPE WEBHOOK: invoice.payment_failed ignored (no subscription)", {
-              eventId: event.id,
-              invoiceId: invoice.id,
-            });
+            console.info(
+              "STRIPE WEBHOOK: invoice.payment_failed ignored (no subscription)",
+              {
+                eventId: event.id,
+                invoiceId: invoice.id,
+              },
+            );
             break;
           }
 
@@ -2283,7 +2306,8 @@ const createCheckoutSession = async (
       }
     }
 
-    const planId = requestedPlanId || getPlanIdForRole(user.role as "seeker" | "recruiter");
+    const planId =
+      requestedPlanId || getPlanIdForRole(user.role as "seeker" | "recruiter");
     const planDefinition = getPlanDefinition(planId);
 
     if (!planDefinition || planDefinition.role !== user.role) {
