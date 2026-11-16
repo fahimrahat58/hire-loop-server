@@ -35,6 +35,73 @@ const getStripe = () => {
   return new Stripe(secretKey);
 };
 
+type HireLoopPlanId = "seeker_premium" | "recruiter_premium";
+
+const PLAN_DEFINITIONS: Record<
+  HireLoopPlanId,
+  { role: "seeker" | "recruiter"; planName: string }
+> = {
+  seeker_premium: {
+    role: "seeker",
+    planName: "Seeker Premium",
+  },
+  recruiter_premium: {
+    role: "recruiter",
+    planName: "Recruiter Premium",
+  },
+};
+
+const getPlanDefinition = (planId: string | null | undefined) => {
+  if (!planId) return null;
+
+  return PLAN_DEFINITIONS[planId as HireLoopPlanId] || null;
+};
+
+const getConfiguredPriceId = (planId: HireLoopPlanId) => {
+  if (planId === "seeker_premium") {
+    return process.env.STRIPE_SEEKER_PRICE_ID;
+  }
+
+  return process.env.STRIPE_RECRUITER_PRICE_ID;
+};
+
+const getPlanIdForRole = (role: "seeker" | "recruiter"): HireLoopPlanId =>
+  role === "seeker" ? "seeker_premium" : "recruiter_premium";
+
+const resolvePlanFromPriceId = (
+  priceId: string | null | undefined,
+): HireLoopPlanId | null => {
+  if (!priceId) return null;
+
+  const seekerPriceId = process.env.STRIPE_SEEKER_PRICE_ID;
+  const recruiterPriceId = process.env.STRIPE_RECRUITER_PRICE_ID;
+
+  if (seekerPriceId && priceId === seekerPriceId) {
+    return "seeker_premium";
+  }
+
+  if (recruiterPriceId && priceId === recruiterPriceId) {
+    return "recruiter_premium";
+  }
+
+  return null;
+};
+
+const getStripeObjectId = (value: unknown): string | null => {
+  if (typeof value === "string") return value;
+
+  if (
+    value &&
+    typeof value === "object" &&
+    "id" in value &&
+    typeof (value as { id?: unknown }).id === "string"
+  ) {
+    return (value as { id: string }).id;
+  }
+
+  return null;
+};
+
 // ====================================
 // CORS
 // ====================================
@@ -239,6 +306,7 @@ const countActiveJobs = async (email: string, excludeJobId?: string) => {
 const saveStripeSubscription = async (
   subscription: Stripe.Subscription,
   fallbackMetadata: Record<string, string> = {},
+  fallbackPriceId?: string | null,
 ) => {
   const existing = await subscriptionsCollection.findOne({
     stripeSubscriptionId: subscription.id,
@@ -248,31 +316,167 @@ const saveStripeSubscription = async (
     ...fallbackMetadata,
     ...(existing?.userId ? { userId: String(existing.userId) } : {}),
     ...(existing?.role ? { role: String(existing.role) } : {}),
-    ...subscription.metadata,
+    ...(existing?.planId ? { planId: String(existing.planId) } : {}),
+    ...(subscription.metadata || {}),
   };
 
-  const userId = metadata.userId;
-  const role = metadata.role;
+  const priceId =
+    getStripeObjectId(subscription.items?.data?.[0]?.price) ||
+    fallbackPriceId ||
+    null;
+
+  const resolvedPlanId =
+    getPlanIdForRole(
+      (metadata.role === "recruiter" ? "recruiter" : "seeker") as
+        | "seeker"
+        | "recruiter",
+    ) && resolvePlanFromPriceId(priceId)
+      ? resolvePlanFromPriceId(priceId)
+      : resolvePlanFromPriceId(priceId) ||
+        (getPlanDefinition(metadata.planId)?.role === metadata.role
+          ? (metadata.planId as HireLoopPlanId)
+          : null);
+
+  let userId = metadata.userId;
+  let role = metadata.role as "seeker" | "recruiter" | undefined;
+
+  if (!userId && existing?.userId) {
+    userId = String(existing.userId);
+  }
+
+  if (!role && existing?.role) {
+    const existingRole = String(existing.role);
+
+    if (existingRole === "seeker" || existingRole === "recruiter") {
+      role = existingRole;
+    }
+  }
+
+  if ((!userId || !role) && existing?.stripeCustomerId) {
+    const mappedByCustomer = await subscriptionsCollection.findOne(
+      {
+        stripeCustomerId: String(existing.stripeCustomerId),
+        userId: { $exists: true },
+        role: { $in: ["seeker", "recruiter"] },
+      },
+      { sort: { updatedAt: -1, createdAt: -1 } },
+    );
+
+    if (mappedByCustomer?.userId && !userId) {
+      userId = String(mappedByCustomer.userId);
+    }
+
+    if (
+      (mappedByCustomer?.role === "seeker" ||
+        mappedByCustomer?.role === "recruiter") &&
+      !role
+    ) {
+      role = mappedByCustomer.role;
+    }
+  }
+
+  // Fallback mapping by Stripe customer ID stored on a previous subscription.
+  if (!userId || !role) {
+    const customerIdForLookup = getStripeObjectId(subscription.customer);
+
+    if (customerIdForLookup) {
+      const mappedByCustomer = await subscriptionsCollection.findOne(
+        {
+          stripeCustomerId: customerIdForLookup,
+          userId: { $exists: true },
+          role: { $in: ["seeker", "recruiter"] },
+        },
+        { sort: { updatedAt: -1, createdAt: -1 } },
+      );
+
+      if (mappedByCustomer?.userId && !userId) {
+        userId = String(mappedByCustomer.userId);
+      }
+
+      if (
+        (mappedByCustomer?.role === "seeker" ||
+          mappedByCustomer?.role === "recruiter") &&
+        !role
+      ) {
+        role = mappedByCustomer.role;
+      }
+    }
+  }
+
+  const inferredPlanId =
+    resolvedPlanId || (role ? getPlanIdForRole(role) : null);
+
+  if (inferredPlanId) {
+    const definition = getPlanDefinition(inferredPlanId);
+
+    // If Stripe price maps to a known plan, enforce that plan's role.
+    if (definition) {
+      role = definition.role;
+    }
+  }
 
   if (!userId || (role !== "seeker" && role !== "recruiter")) {
     // Never invent ownership. If Stripe sends a subscription we cannot map to
     // a HireLoop user, skip it instead of letting the webhook fail forever.
-    console.warn("STRIPE SUBSCRIPTION SKIPPED (missing metadata):", {
+    console.warn("STRIPE SUBSCRIPTION SKIPPED (missing mapping):", {
       subscriptionId: subscription.id,
+      stripeCustomerId: getStripeObjectId(subscription.customer),
+      priceId,
+    });
+    return false;
+  }
+
+  const finalPlanId = inferredPlanId || getPlanIdForRole(role);
+  const planDefinition = getPlanDefinition(finalPlanId) || PLAN_DEFINITIONS[getPlanIdForRole(role)];
+
+  if (!ObjectId.isValid(userId)) {
+    console.warn("STRIPE SUBSCRIPTION SKIPPED (invalid userId):", {
+      subscriptionId: subscription.id,
+      userId,
+    });
+    return false;
+  }
+
+  const userObjectId = new ObjectId(userId);
+  const user = await usersCollection.findOne(
+    { _id: userObjectId },
+    { projection: { role: 1, email: 1 } },
+  );
+
+  if (!user) {
+    console.warn("STRIPE SUBSCRIPTION SKIPPED (user not found):", {
+      subscriptionId: subscription.id,
+      userId,
+    });
+    return false;
+  }
+
+  const userRole = String(user.role || "")
+    .trim()
+    .toLowerCase();
+
+  if (userRole !== role) {
+    // Ensure the correct logged-in user/role receives the subscription update.
+    console.warn("STRIPE SUBSCRIPTION SKIPPED (role mismatch):", {
+      subscriptionId: subscription.id,
+      userId,
+      expectedRole: role,
+      actualRole: userRole,
     });
     return false;
   }
 
   const subscriptionData = subscription as any;
 
+  const periodStart =
+    subscriptionData.current_period_start ??
+    subscriptionData.items?.data?.[0]?.current_period_start;
+
   const periodEnd =
     subscriptionData.current_period_end ??
     subscriptionData.items?.data?.[0]?.current_period_end;
 
-  const customerId =
-    typeof subscription.customer === "string"
-      ? subscription.customer
-      : subscription.customer.id;
+  const customerId = getStripeObjectId(subscription.customer);
 
   // "active" covers both active and trialing subscriptions so access checks
   // stay simple. The raw Stripe status is retained for display.
@@ -281,19 +485,27 @@ const saveStripeSubscription = async (
       ? "active"
       : subscription.status;
 
+  const currentPeriodStart = periodStart ? new Date(periodStart * 1000) : null;
+  const currentPeriodEnd = periodEnd ? new Date(periodEnd * 1000) : null;
+  const cancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
+
   const subscriptionDocument = {
     userId,
+    userEmail: String(user.email || "").toLowerCase(),
     role,
-    planName: role === "seeker" ? "Seeker Premium" : "Recruiter Premium",
+    planId: finalPlanId,
+    planName: planDefinition.planName,
+    stripePriceId: priceId,
     stripeCustomerId: customerId,
     stripeSubscriptionId: subscription.id,
     status,
     stripeStatus: subscription.status,
-    cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+    cancelAtPeriodEnd,
     canceledAt: subscription.canceled_at
       ? new Date(subscription.canceled_at * 1000)
       : null,
-    currentPeriodEnd: periodEnd ? new Date(periodEnd * 1000) : null,
+    currentPeriodStart,
+    currentPeriodEnd,
     updatedAt: new Date(),
   };
 
@@ -312,13 +524,36 @@ const saveStripeSubscription = async (
     },
   );
 
+  const userSubscriptionUpdate = {
+    "subscription.planId": finalPlanId,
+    "subscription.planName":
+      status === "active" ? planDefinition.planName : "Free",
+    "subscription.status": status,
+    "subscription.stripeStatus": subscription.status,
+    "subscription.stripeCustomerId": customerId,
+    "subscription.stripeSubscriptionId": subscription.id,
+    "subscription.stripePriceId": priceId,
+    "subscription.cancelAtPeriodEnd": cancelAtPeriodEnd,
+    "subscription.currentPeriodStart": currentPeriodStart,
+    "subscription.currentPeriodEnd": currentPeriodEnd,
+    "subscription.renewalDate": currentPeriodEnd,
+    "subscription.updatedAt": new Date(),
+  };
+
+  await usersCollection.updateOne(
+    { _id: userObjectId },
+    { $set: userSubscriptionUpdate },
+  );
+
   console.log("STRIPE SUBSCRIPTION SYNCED:", {
     userId,
     role,
+    planId: finalPlanId,
+    priceId,
     subscriptionId: subscription.id,
     status,
-    cancelAtPeriodEnd: subscriptionDocument.cancelAtPeriodEnd,
-    currentPeriodEnd: subscriptionDocument.currentPeriodEnd,
+    cancelAtPeriodEnd,
+    currentPeriodEnd,
   });
 
   return true;
@@ -473,18 +708,22 @@ app.post(
             break;
           }
 
-          const subscriptionId =
-            typeof session.subscription === "string"
-              ? session.subscription
-              : session.subscription.id;
+          const subscriptionId = getStripeObjectId(session.subscription);
 
-          const subscription =
-            await getStripe().subscriptions.retrieve(subscriptionId);
+          if (!subscriptionId) {
+            break;
+          }
+
+          const subscription = await getStripe().subscriptions.retrieve(
+            subscriptionId,
+            { expand: ["items.data.price"] },
+          );
 
           await saveStripeSubscription(subscription, {
             userId:
               session.metadata?.userId || session.client_reference_id || "",
             role: session.metadata?.role || "",
+            planId: session.metadata?.planId || "",
           });
 
           console.log("CHECKOUT COMPLETED:", subscriptionId);
@@ -498,7 +737,11 @@ app.post(
 
         case "customer.subscription.created":
         case "customer.subscription.updated": {
-          const subscription = event.data.object as Stripe.Subscription;
+          const subscriptionEvent = event.data.object as Stripe.Subscription;
+          const subscription = await getStripe().subscriptions.retrieve(
+            subscriptionEvent.id,
+            { expand: ["items.data.price"] },
+          );
 
           await saveStripeSubscription(subscription);
 
@@ -516,11 +759,42 @@ app.post(
         // ====================================
 
         case "customer.subscription.deleted": {
-          const subscription = event.data.object as Stripe.Subscription;
+          const subscriptionEvent = event.data.object as Stripe.Subscription;
+          const subscription = await getStripe().subscriptions.retrieve(
+            subscriptionEvent.id,
+            { expand: ["items.data.price"] },
+          );
 
           await saveStripeSubscription(subscription);
 
           console.log("SUBSCRIPTION CANCELED:", subscription.id);
+
+          break;
+        }
+
+        // ====================================
+        // INVOICE PAID (renewals / confirmations)
+        // ====================================
+
+        case "invoice.paid": {
+          const invoice = event.data.object as Stripe.Invoice;
+          const invoiceData = invoice as Stripe.Invoice & {
+            subscription?: string | Stripe.Subscription | null;
+          };
+          const subscriptionId = getStripeObjectId(invoiceData.subscription);
+
+          if (!subscriptionId) {
+            break;
+          }
+
+          const subscription = await getStripe().subscriptions.retrieve(
+            subscriptionId,
+            { expand: ["items.data.price"] },
+          );
+
+          await saveStripeSubscription(subscription);
+
+          console.log("INVOICE PAID:", invoice.id, subscriptionId);
 
           break;
         }
@@ -1727,6 +2001,9 @@ app.get(
           data: {
             role: "seeker",
             plan: isPremium ? "premium" : "free",
+            planId: isPremium
+              ? String(latestSubscription?.planId || "seeker_premium")
+              : "free",
             planName: subscriptionState.planName,
             subscriptionStatus: subscriptionState.status,
             cancelAtPeriodEnd: subscriptionState.cancelAtPeriodEnd,
@@ -1736,6 +2013,7 @@ app.get(
               ? null
               : Math.max(0, FREE_APPLICATION_LIMIT - applicationsUsed),
             currentPeriodEnd: subscriptionState.currentPeriodEnd,
+            renewalDate: subscriptionState.currentPeriodEnd,
           },
         });
 
@@ -1751,6 +2029,9 @@ app.get(
         data: {
           role: "recruiter",
           plan: isPremium ? "premium" : "free",
+          planId: isPremium
+            ? String(latestSubscription?.planId || "recruiter_premium")
+            : "free",
           planName: subscriptionState.planName,
           subscriptionStatus: subscriptionState.status,
           cancelAtPeriodEnd: subscriptionState.cancelAtPeriodEnd,
@@ -1760,6 +2041,7 @@ app.get(
             ? null
             : Math.max(0, FREE_PUBLISHED_JOB_LIMIT - publishedJobsUsed),
           currentPeriodEnd: subscriptionState.currentPeriodEnd,
+          renewalDate: subscriptionState.currentPeriodEnd,
         },
       });
     } catch (error) {
@@ -1776,6 +2058,47 @@ app.get(
 // ====================================
 // STRIPE CHECKOUT SESSION
 // ====================================
+
+const normalizeRequestedPlanId = (
+  value: unknown,
+  role: "seeker" | "recruiter",
+): HireLoopPlanId | null => {
+  if (typeof value !== "string") {
+    return getPlanIdForRole(role);
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  if (!normalized) {
+    return getPlanIdForRole(role);
+  }
+
+  if (normalized === "free" || normalized === "starter") {
+    return null;
+  }
+
+  if (normalized === "premium") {
+    return getPlanIdForRole(role);
+  }
+
+  if (normalized === "seeker_premium" || normalized === "seeker-premium") {
+    return role === "seeker" ? "seeker_premium" : null;
+  }
+
+  if (
+    normalized === "recruiter_premium" ||
+    normalized === "recruiter-premium"
+  ) {
+    return role === "recruiter" ? "recruiter_premium" : null;
+  }
+
+  // Backward-compatible: role-scoped premium is the only paid plan today.
+  if (normalized === "growth") {
+    return getPlanIdForRole(role);
+  }
+
+  return null;
+};
 
 const createCheckoutSession = async (
   req: AuthRequest,
@@ -1811,10 +2134,34 @@ const createCheckoutSession = async (
       return;
     }
 
-    const priceId =
-      user.role === "seeker"
-        ? process.env.STRIPE_SEEKER_PRICE_ID
-        : process.env.STRIPE_RECRUITER_PRICE_ID;
+    const requestedPlanId = normalizeRequestedPlanId(
+      req.body?.planId ?? req.body?.plan,
+      user.role as "seeker" | "recruiter",
+    );
+
+    if (req.body?.planId || req.body?.plan) {
+      if (!requestedPlanId) {
+        res.status(400).json({
+          success: false,
+          message:
+            "The selected plan is not available for your account. Please choose a valid plan from the billing page.",
+        });
+        return;
+      }
+    }
+
+    const planId = requestedPlanId || getPlanIdForRole(user.role as "seeker" | "recruiter");
+    const planDefinition = getPlanDefinition(planId);
+
+    if (!planDefinition || planDefinition.role !== user.role) {
+      res.status(400).json({
+        success: false,
+        message: "The selected plan is not available for your account.",
+      });
+      return;
+    }
+
+    const priceId = getConfiguredPriceId(planId);
 
     if (!priceId || !priceId.startsWith("price_")) {
       res.status(500).json({
@@ -1838,6 +2185,11 @@ const createCheckoutSession = async (
       return;
     }
 
+    const successPath =
+      user.role === "recruiter"
+        ? "/dashboard/recruiter/billing"
+        : "/dashboard/seeker/billing";
+
     const session = await getStripe().checkout.sessions.create({
       mode: "subscription",
       line_items: [
@@ -1852,22 +2204,20 @@ const createCheckoutSession = async (
         userId: user.id,
         userEmail: user.email,
         role: user.role,
+        planId,
+        planName: planDefinition.planName,
       },
       subscription_data: {
         metadata: {
           userId: user.id,
           userEmail: user.email,
           role: user.role,
+          planId,
+          planName: planDefinition.planName,
         },
       },
-      success_url:
-        user.role === "recruiter"
-          ? `${frontendUrl}/dashboard/recruiter/billing?success=true`
-          : `${frontendUrl}/dashboard/seeker/billing?success=true`,
-      cancel_url:
-        user.role === "recruiter"
-          ? `${frontendUrl}/dashboard/recruiter/billing?canceled=true`
-          : `${frontendUrl}/dashboard/seeker/billing?canceled=true`,
+      success_url: `${frontendUrl}${successPath}?success=true&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}${successPath}?canceled=true`,
     });
 
     if (!session.url) {
@@ -1879,6 +2229,8 @@ const createCheckoutSession = async (
         success: true,
         data: {
           url: session.url,
+          sessionId: session.id,
+          planId,
         },
       });
 
@@ -1888,6 +2240,8 @@ const createCheckoutSession = async (
     res.status(200).json({
       success: true,
       url: session.url,
+      sessionId: session.id,
+      planId,
     });
   } catch (error) {
     console.error("CREATE CHECKOUT SESSION ERROR:", error);
