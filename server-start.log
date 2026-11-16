@@ -1,0 +1,10 @@
+MongoDB Connected Successfully
+MongoDB collections connected successfully
+Seeker application limit: 5
+Recruiter active job limit: 5
+Recruiter Premium: Unlimited active jobs
+Stripe subscription indexes ready
+Stripe webhook event index ready
+Saved Jobs indexes ready
+HireLoop server running on port 5000
+Allowed frontend origins: [ 'http://localhost:3000' ]
