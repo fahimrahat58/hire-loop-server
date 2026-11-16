@@ -1,13 +1,12 @@
 {
   "name": "hireloop-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "HireLoop Backend API",
+  "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "tsx watch index.ts",
     "build": "tsc",
-    "start": "node dist/index.ts"
+    "start": "node dist/index.js"
   },
   "keywords": [],
   "type": "module",
