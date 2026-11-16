@@ -1,4 +1,11 @@
+
 import { app, initializeApp } from "../index.ts";
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
 let ready: Promise<void> | null = null;
 
