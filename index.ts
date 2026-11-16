@@ -2711,11 +2711,17 @@ app.use(
 );
 
 // ====================================
-// START SERVER
+// START SERVER / SERVERLESS INITIALIZATION
 // ====================================
 
-const startServer = async () => {
-  try {
+let initializationPromise: Promise<void> | null = null;
+
+const initializeApp = async () => {
+  if (initializationPromise) {
+    return initializationPromise;
+  }
+
+  initializationPromise = (async () => {
     const db = await connectDB();
 
     jobsCollection = db.collection("jobs");
@@ -2825,6 +2831,17 @@ const startServer = async () => {
     console.log("Stripe subscription indexes ready");
     console.log("Stripe webhook event index ready");
     console.log("Saved Jobs indexes ready");
+  })().catch((error) => {
+    initializationPromise = null;
+    throw error;
+  });
+
+  return initializationPromise;
+};
+
+const startServer = async () => {
+  try {
+    await initializeApp();
 
     app.listen(PORT, () => {
       console.log(`HireLoop server running on port ${PORT}`);
@@ -2836,4 +2853,14 @@ const startServer = async () => {
   }
 };
 
-startServer();
+// Export for Vercel/serverless runtimes while preserving standalone startup.
+export { app, initializeApp };
+export default app;
+
+const isDirectRun =
+  typeof process.argv[1] === "string" &&
+  /(?:^|[\\/])index\.(?:ts|js)$/.test(process.argv[1]);
+
+if (!process.env.VERCEL && isDirectRun) {
+  void startServer();
+}
