@@ -494,11 +494,13 @@ const saveStripeSubscription = async (
     userEmail: String(user.email || "").toLowerCase(),
     role,
     planId: finalPlanId,
+    plan: finalPlanId,
     planName: planDefinition.planName,
     stripePriceId: priceId,
     stripeCustomerId: customerId,
     stripeSubscriptionId: subscription.id,
     status,
+    subscriptionStatus: status,
     stripeStatus: subscription.status,
     cancelAtPeriodEnd,
     canceledAt: subscription.canceled_at
@@ -525,19 +527,18 @@ const saveStripeSubscription = async (
   );
 
   const userSubscriptionUpdate = {
-    "subscription.planId": finalPlanId,
-    "subscription.planName":
-      status === "active" ? planDefinition.planName : "Free",
-    "subscription.status": status,
-    "subscription.stripeStatus": subscription.status,
-    "subscription.stripeCustomerId": customerId,
-    "subscription.stripeSubscriptionId": subscription.id,
-    "subscription.stripePriceId": priceId,
-    "subscription.cancelAtPeriodEnd": cancelAtPeriodEnd,
-    "subscription.currentPeriodStart": currentPeriodStart,
-    "subscription.currentPeriodEnd": currentPeriodEnd,
-    "subscription.renewalDate": currentPeriodEnd,
-    "subscription.updatedAt": new Date(),
+    plan: finalPlanId,
+    planName: status === "active" ? planDefinition.planName : "Free",
+    subscriptionStatus: status,
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id,
+    stripePriceId: priceId,
+    currentPeriodStart,
+    currentPeriodEnd,
+    cancelAtPeriodEnd,
+    stripeStatus: subscription.status,
+    role,
+    updatedAt: new Date(),
   };
 
   await usersCollection.updateOne(
@@ -795,6 +796,33 @@ app.post(
           await saveStripeSubscription(subscription);
 
           console.log("INVOICE PAID:", invoice.id, subscriptionId);
+
+          break;
+        }
+
+        // ====================================
+        // INVOICE PAYMENT FAILED
+        // ====================================
+
+        case "invoice.payment_failed": {
+          const invoice = event.data.object as Stripe.Invoice;
+          const invoiceData = invoice as Stripe.Invoice & {
+            subscription?: string | Stripe.Subscription | null;
+          };
+          const subscriptionId = getStripeObjectId(invoiceData.subscription);
+
+          if (!subscriptionId) {
+            break;
+          }
+
+          const subscription = await getStripe().subscriptions.retrieve(
+            subscriptionId,
+            { expand: ["items.data.price"] },
+          );
+
+          await saveStripeSubscription(subscription);
+
+          console.log("INVOICE PAYMENT FAILED:", invoice.id, subscriptionId);
 
           break;
         }
@@ -2223,6 +2251,14 @@ const createCheckoutSession = async (
     if (!session.url) {
       throw new Error("Stripe checkout session URL is missing");
     }
+
+    console.log("STRIPE CHECKOUT SESSION CREATED:", {
+      userId: user.id,
+      role: user.role,
+      planId,
+      priceId,
+      sessionId: session.id,
+    });
 
     if (responseFormat === "nested") {
       res.status(200).json({
