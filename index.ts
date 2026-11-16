@@ -116,24 +116,53 @@ const normalizeOrigin = (value?: string) => {
   }
 };
 
+const configuredOrigins = [
+  "http://localhost:3000",
+  ...(process.env.FRONTEND_URL || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+  process.env.AUTH_BASE_URL,
+];
+
 const allowedOrigins = Array.from(
   new Set(
-    [
-      "http://localhost:3000",
-      process.env.FRONTEND_URL,
-      process.env.AUTH_BASE_URL,
-    ]
+    configuredOrigins
       .map(normalizeOrigin)
       .filter((origin): origin is string => Boolean(origin)),
   ),
 );
 
+// Production and legitimate preview deployments for this specific Vercel project.
+const allowedVercelOriginPatterns = [
+  /^https:\/\/hire-loop-client-programming-hero11\.vercel\.app$/i,
+  /^https:\/\/hire-loop-client-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-programming-hero11\.vercel\.app$/i,
+];
+
+const isAllowedOrigin = (origin?: string) => {
+  if (!origin) return true;
+
+  const normalized = normalizeOrigin(origin);
+
+  if (!normalized) return false;
+
+  if (allowedOrigins.includes(normalized)) {
+    return true;
+  }
+
+  return allowedVercelOriginPatterns.some((pattern) =>
+    pattern.test(normalized),
+  );
+};
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (isAllowedOrigin(origin)) {
         return callback(null, true);
       }
+
+      console.error("SERVER ERROR: CORS blocked for origin:", origin);
 
       return callback(new Error(`CORS blocked for origin: ${origin}`));
     },
