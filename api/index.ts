@@ -1,4 +1,4 @@
-import app, { initializeApp } from "../index.js";
+import { app, initializeApp } from "../index.js";
 
 let ready: Promise<void> | null = null;
 
