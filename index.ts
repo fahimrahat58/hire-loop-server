@@ -1887,6 +1887,56 @@ app.post(
   },
 );
 
+/* ====================================
+   SEEKER - MY APPLICATIONS
+==================================== */
+
+app.get(
+  "/api/applications/my-applications",
+  verifyUser,
+  verifySeeker,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+
+      const applications = await applicationsCollection
+        .find({
+          $or: [{ applicantUserId: user.id }, { applicantEmail: user.email }],
+        })
+        .sort({ appliedAt: -1 })
+        .toArray();
+
+      const data = applications.map((application) => ({
+        id: application._id.toString(),
+        jobId: application.jobId?.toString() || "",
+        jobTitle: application.jobTitle || "",
+        company: application.company || "",
+        applicantName: application.applicantName || "",
+        applicantEmail: application.applicantEmail || "",
+        experience: application.experience || "",
+        resumeUrl: application.resumeUrl || "",
+        coverLetter: application.coverLetter || "",
+        status: application.status || "Applied",
+        appliedAt: application.appliedAt,
+        updatedAt: application.updatedAt,
+      }));
+
+      res.status(200).json({
+        success: true,
+        data,
+        total: data.length,
+      });
+    } catch (error) {
+      console.error("GET MY APPLICATIONS ERROR:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch your applications",
+      });
+    }
+  },
+);
+
 // ====================================
 // RECRUITER APPLICATIONS
 // ====================================
